@@ -46,6 +46,8 @@ import json
 import queue
 import random
 import shutil
+import subprocess
+import sys
 import threading
 import time
 import tkinter as tk
@@ -57,8 +59,14 @@ from shapely.geometry import Polygon as ShapelyPolygon
 
 from organic_curve import (generate, render_png, render_svg, GenerationError,
                             max_safe_render_stroke, fill_polygon, FILL_SHAPES, crawl_bands)
+from wallpaper_engine import (load_config as load_wallpaper_config,
+                               save_config as save_wallpaper_config,
+                               DEFAULT_PRESETS as WALLPAPER_DEFAULT_PRESETS)
 
 OUTPUT_DIR = Path(__file__).parent / "outputs"
+WALLPAPER_ENGINE_PATH = Path(__file__).parent / "wallpaper_engine.py"
+WALLPAPER_SHAPE_CHOICES = [s for s in FILL_SHAPES if s != "custom"]  # 'custom' needs a hand-drawn
+                                                                       # region, not meaningful per-preset
 PREVIEW_BASENAME = "preview"
 PREVIEW_DISPLAY_SIZE = 560  # on-screen preview box, px
 
@@ -93,6 +101,15 @@ class CurveApp(tk.Tk):
         self._crawl_phase = 0.0  # px along the path the pattern has shifted so far
         self._crawl_last_tick = 0.0
         self._last_static_img = None  # the most recent crisp (non-animating) render, to restore on Stop
+
+        # Live wallpaper dialog/process state (see _open_wallpaper_dialog).
+        # Kept at the app level, not the dialog, so a running wallpaper
+        # process and its status stay tracked even if the dialog is closed
+        # and reopened -- the wallpaper itself is meant to outlive both the
+        # dialog and this whole app once started.
+        self._wallpaper_dialog = None
+        self._wallpaper_proc = None
+        self._wallpaper_status_var = tk.StringVar(value="Not running")
 
         OUTPUT_DIR.mkdir(exist_ok=True)
 
@@ -445,6 +462,19 @@ class CurveApp(tk.Tk):
         row += 1
         ttk.Button(parent, text="Clear saved copies", command=self._clear_outputs).grid(
             row=row, column=0, columnspan=2, sticky="ew")
+        row += 1
+
+        # --- Live wallpaper (independent of everything above -- a ---
+        # separate background process, see wallpaper_engine.py) ---
+        ttk.Label(parent, text="Live wallpaper", font=("", 10, "bold")).grid(
+            row=row, column=0, columnspan=2, sticky="w", pady=(14, 2))
+        row += 1
+        ttk.Button(parent, text="Configure Wallpaper...", command=self._open_wallpaper_dialog).grid(
+            row=row, column=0, columnspan=2, sticky="ew")
+        row += 1
+        ttk.Label(parent, text="Windows only. A rotating set of colors/shapes\n"
+                               "crawling behind your desktop icons, one per day.",
+                  foreground="#666").grid(row=row, column=0, columnspan=2, sticky="w", pady=(2, 0))
         row += 1
 
     def _build_preview(self, parent):
@@ -1144,6 +1174,394 @@ class CurveApp(tk.Tk):
                 f.unlink()
                 removed += 1
         messagebox.showinfo("Cleared", f"Removed {removed} saved file(s). The current preview was kept.")
+
+    # ------------------------------------------------------ live wallpaper ----
+    # A "Wallpaper" dialog for configuring wallpaper_engine.py's daily-rotating
+    # preset list (see that file for the engine itself). Deliberately a
+    # separate Toplevel rather than more sidebar controls: unlike everything
+    # above, none of this depends on a curve having been generated here, and
+    # the wallpaper process it can start keeps running independently of this
+    # window (and of the app) once launched.
+
+    def _open_wallpaper_dialog(self):
+        if self._wallpaper_dialog is not None and self._wallpaper_dialog.winfo_exists():
+            self._wallpaper_dialog.lift()
+            self._wallpaper_dialog.focus_force()
+            return
+
+        self._wp_cfg = load_wallpaper_config()
+        self._wp_saved_snapshot = json.dumps(self._wp_cfg, sort_keys=True)
+        self._wp_selected = 0 if self._wp_cfg["presets"] else -1
+
+        win = tk.Toplevel(self)
+        win.title("Live Wallpaper")
+        win.transient(self)
+        win.resizable(False, False)
+        win.protocol("WM_DELETE_WINDOW", self._close_wallpaper_dialog)
+        self._wallpaper_dialog = win
+
+        self._build_wallpaper_dialog(win)
+        self._wp_update_run_buttons()
+
+    def _close_wallpaper_dialog(self):
+        if json.dumps(self._wp_cfg, sort_keys=True) != self._wp_saved_snapshot:
+            if not messagebox.askyesno("Unsaved changes", "Discard unsaved wallpaper changes?",
+                                        parent=self._wallpaper_dialog):
+                return
+        self._wallpaper_dialog.destroy()
+        self._wallpaper_dialog = None
+
+    def _build_wallpaper_dialog(self, win):
+        pad = ttk.Frame(win, padding=12)
+        pad.grid(row=0, column=0, sticky="nsew")
+
+        # --- preset list (left column) ---
+        list_frame = ttk.Frame(pad)
+        list_frame.grid(row=0, column=0, sticky="n", padx=(0, 14))
+        ttk.Label(list_frame, text="Daily rotation", font=("", 10, "bold")).pack(anchor="w")
+        ttk.Label(list_frame, text="One per day, in order,\nwrapping back to the top.",
+                  foreground="#666").pack(anchor="w", pady=(0, 4))
+        self._wp_listbox = tk.Listbox(list_frame, height=10, width=10, exportselection=False)
+        self._wp_listbox.pack(fill="y")
+        self._wp_listbox.bind("<<ListboxSelect>>", self._on_wallpaper_preset_selected)
+
+        list_btn_row = ttk.Frame(list_frame)
+        list_btn_row.pack(fill="x", pady=(4, 0))
+        ttk.Button(list_btn_row, text="Add", width=6, command=self._wp_add_preset).grid(
+            row=0, column=0, padx=1, pady=1)
+        self._wp_remove_btn = ttk.Button(list_btn_row, text="Remove", width=8, command=self._wp_remove_preset)
+        self._wp_remove_btn.grid(row=0, column=1, padx=1, pady=1)
+        ttk.Button(list_btn_row, text="▲", width=3, command=lambda: self._wp_move_preset(-1)).grid(
+            row=1, column=0, padx=1, pady=1)
+        ttk.Button(list_btn_row, text="▼", width=3, command=lambda: self._wp_move_preset(1)).grid(
+            row=1, column=1, padx=1, pady=1)
+
+        # --- selected-preset editor (right column, top) ---
+        editor = ttk.Frame(pad)
+        editor.grid(row=0, column=1, sticky="n")
+        erow = 0
+
+        ttk.Label(editor, text="Selected preset", font=("", 10, "bold")).grid(
+            row=erow, column=0, columnspan=2, sticky="w")
+        erow += 1
+
+        ttk.Label(editor, text="Fill shape").grid(row=erow, column=0, sticky="w", pady=(8, 0))
+        erow += 1
+        self._wp_shape_var = tk.StringVar(value="square")
+        shape_combo = ttk.Combobox(editor, textvariable=self._wp_shape_var, values=WALLPAPER_SHAPE_CHOICES,
+                                    state="readonly", width=12)
+        shape_combo.grid(row=erow, column=0, columnspan=2, sticky="w")
+        shape_combo.bind("<<ComboboxSelected>>", lambda _e: self._wp_editor_changed())
+        erow += 1
+
+        color_row = ttk.Frame(editor)
+        color_row.grid(row=erow, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        erow += 1
+        self._wp_color_vars = [tk.StringVar(value=c) for c in ("#ff595e", "#ffd166", "#7fe7c4")]
+        self._wp_color_btns = []
+        for i, cvar in enumerate(self._wp_color_vars):
+            btn = tk.Button(color_row, text=f"Color {i + 1}", width=9,
+                             background=cvar.get(), activebackground=cvar.get(),
+                             foreground=self._contrast_text_color(cvar.get()))
+            btn.config(command=lambda v=cvar, b=btn, n=i + 1: self._wp_pick_color(v, b, f"Color {n}"))
+            btn.pack(side="left", padx=(0 if i == 0 else 4, 0))
+            self._wp_color_btns.append(btn)
+
+        def wp_slider(label, frm, to, step, fmt="{:.0f}"):
+            nonlocal erow
+            ttk.Label(editor, text=label).grid(row=erow, column=0, columnspan=2, sticky="w", pady=(8, 0))
+            erow += 1
+            val_label = ttk.Label(editor, text=fmt.format(frm), width=8)
+            val_label.grid(row=erow, column=1, sticky="e")
+            var = tk.DoubleVar(value=frm)
+
+            def on_move(_evt=None, v=var, l=val_label, s=step, f=fmt):
+                snapped = round(v.get() / s) * s
+                v.set(snapped)
+                l.config(text=f.format(snapped))
+                self._wp_editor_changed()
+
+            scale = ttk.Scale(editor, from_=frm, to=to, variable=var, command=lambda _v: on_move())
+            scale.grid(row=erow, column=0, sticky="ew")
+            erow += 1
+            scale.refresh_label = lambda v=var, l=val_label, f=fmt: l.config(text=f.format(v.get()))
+            return var, scale
+
+        self._wp_size_var, self._wp_size_scale = wp_slider("Crawler size (px)", 4.0, 300.0, 2.0)
+        self._wp_gap_var, self._wp_gap_scale = wp_slider("Gap between crawlers (px)", 0.0, 300.0, 2.0)
+        self._wp_speed_var, self._wp_speed_scale = wp_slider("Crawl speed (px/s)", 10.0, 2000.0, 10.0)
+
+        ttk.Button(editor, text="Copy from current Color crawl settings",
+                   command=self._wp_copy_from_generator).grid(
+            row=erow, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        erow += 1
+        ttk.Label(editor, text="Grabs the colors/crawler size/gap/speed\n"
+                               "set in the main Color crawl controls.",
+                  foreground="#666").grid(row=erow, column=0, columnspan=2, sticky="w", pady=(2, 0))
+
+        # --- global display settings (bottom, full width) ---
+        ttk.Separator(pad, orient="horizontal").grid(row=1, column=0, columnspan=2, sticky="ew", pady=(14, 10))
+        grow = 2
+        ttk.Label(pad, text="Display settings", font=("", 10, "bold")).grid(
+            row=grow, column=0, columnspan=2, sticky="w")
+        grow += 1
+
+        bg_row = ttk.Frame(pad)
+        bg_row.grid(row=grow, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        grow += 1
+        ttk.Label(bg_row, text="Background:").pack(side="left")
+        self._wp_bg_var = tk.StringVar(value=self._wp_cfg.get("bg_color", "#0b1220"))
+        self._wp_bg_btn = tk.Button(bg_row, text="Background", width=12,
+                                     background=self._wp_bg_var.get(), activebackground=self._wp_bg_var.get(),
+                                     foreground=self._contrast_text_color(self._wp_bg_var.get()),
+                                     command=self._wp_pick_bg_color)
+        self._wp_bg_btn.pack(side="left", padx=(6, 0))
+
+        def wp_global_slider(label, key, frm, to, step, fmt="{:.1f}"):
+            nonlocal grow
+            ttk.Label(pad, text=label).grid(row=grow, column=0, columnspan=2, sticky="w", pady=(8, 0))
+            grow += 1
+            val_label = ttk.Label(pad, text=fmt.format(self._wp_cfg.get(key, frm)), width=8)
+            val_label.grid(row=grow, column=1, sticky="e")
+            var = tk.DoubleVar(value=self._wp_cfg.get(key, frm))
+
+            def on_move(_evt=None, v=var, l=val_label, s=step, f=fmt, k=key):
+                snapped = round(v.get() / s) * s
+                v.set(snapped)
+                l.config(text=f.format(snapped))
+                self._wp_cfg[k] = snapped
+
+            scale = ttk.Scale(pad, from_=frm, to=to, variable=var, command=lambda _v: on_move())
+            scale.grid(row=grow, column=0, sticky="ew")
+            grow += 1
+            return var
+
+        self._wp_stroke_var = wp_global_slider("Stroke width (px)", "stroke", 1.0, 20.0, 0.5)
+        self._wp_edge_var = wp_global_slider("Edge inset (px)", "edge", 0.5, 60.0, 0.5)
+        ttk.Label(pad, text="Keep this small so the pattern reaches\nessentially edge-to-edge.",
+                  foreground="#666").grid(row=grow, column=0, columnspan=2, sticky="w", pady=(0, 4))
+        grow += 1
+
+        ttk.Label(pad, text="Monitors").grid(row=grow, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        grow += 1
+        self._wp_monitor_var = tk.StringVar(value=self._wp_cfg.get("monitor_mode", "primary"))
+        mon_row = ttk.Frame(pad)
+        mon_row.grid(row=grow, column=0, columnspan=2, sticky="w")
+        grow += 1
+        ttk.Radiobutton(mon_row, text="This monitor only", value="primary", variable=self._wp_monitor_var,
+                         command=self._wp_monitor_changed).pack(anchor="w")
+        ttk.Radiobutton(mon_row, text="Stretch across all monitors", value="all", variable=self._wp_monitor_var,
+                         command=self._wp_monitor_changed).pack(anchor="w")
+
+        # --- run controls ---
+        ttk.Separator(pad, orient="horizontal").grid(row=grow, column=0, columnspan=2, sticky="ew", pady=(14, 10))
+        grow += 1
+        status_row = ttk.Frame(pad)
+        status_row.grid(row=grow, column=0, columnspan=2, sticky="ew")
+        grow += 1
+        ttk.Label(status_row, text="Status:").pack(side="left")
+        ttk.Label(status_row, textvariable=self._wallpaper_status_var).pack(side="left", padx=(4, 0))
+
+        run_row = ttk.Frame(pad)
+        run_row.grid(row=grow, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+        grow += 1
+        self._wp_start_btn = ttk.Button(run_row, text="Start Wallpaper Now", command=self._wp_start)
+        self._wp_start_btn.pack(side="left", fill="x", expand=True)
+        self._wp_stop_btn = ttk.Button(run_row, text="Stop Wallpaper", command=self._wp_stop)
+        self._wp_stop_btn.pack(side="left", fill="x", expand=True, padx=(6, 0))
+        ttk.Label(pad, text="Starting saves your changes first, then runs\n"
+                            "wallpaper_engine.py in the background -- it keeps\n"
+                            "going even after you close this window or the app.",
+                  foreground="#666").grid(row=grow, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        grow += 1
+
+        bottom_row = ttk.Frame(pad)
+        bottom_row.grid(row=grow, column=0, columnspan=2, sticky="ew", pady=(14, 0))
+        ttk.Button(bottom_row, text="Save", command=self._wp_save).pack(side="left", fill="x", expand=True)
+        ttk.Button(bottom_row, text="Close", command=self._close_wallpaper_dialog).pack(
+            side="left", fill="x", expand=True, padx=(6, 0))
+
+        self._wp_refresh_listbox()
+
+    def _wp_refresh_listbox(self):
+        self._wp_listbox.delete(0, tk.END)
+        for i, preset in enumerate(self._wp_cfg["presets"]):
+            self._wp_listbox.insert(tk.END, f"Day {i + 1}")
+            color0 = preset.get("colors", ["#333333"])[0]
+            self._wp_listbox.itemconfig(i, background=color0, foreground=self._contrast_text_color(color0))
+        if self._wp_cfg["presets"]:
+            self._wp_selected = max(0, min(self._wp_selected, len(self._wp_cfg["presets"]) - 1))
+            self._wp_listbox.selection_set(self._wp_selected)
+            self._wp_load_editor(self._wp_selected)
+        else:
+            self._wp_selected = -1
+        self._wp_remove_btn.config(state="normal" if len(self._wp_cfg["presets"]) > 1 else "disabled")
+
+    def _wp_load_editor(self, idx):
+        preset = self._wp_cfg["presets"][idx]
+        self._wp_shape_var.set(preset.get("fill_shape", "square"))
+        colors = preset.get("colors") or ["#ff595e", "#ffd166", "#7fe7c4"]
+        for i, cvar in enumerate(self._wp_color_vars):
+            hexval = colors[i] if i < len(colors) else "#888888"
+            cvar.set(hexval)
+            btn = self._wp_color_btns[i]
+            btn.config(background=hexval, activebackground=hexval, foreground=self._contrast_text_color(hexval))
+        self._wp_size_var.set(preset.get("crawler_size", 40.0))
+        self._wp_size_scale.refresh_label()
+        self._wp_gap_var.set(preset.get("gap", 20.0))
+        self._wp_gap_scale.refresh_label()
+        self._wp_speed_var.set(preset.get("speed", 200.0))
+        self._wp_speed_scale.refresh_label()
+
+    def _on_wallpaper_preset_selected(self, _evt=None):
+        sel = self._wp_listbox.curselection()
+        if not sel:
+            return
+        self._wp_selected = sel[0]
+        self._wp_load_editor(self._wp_selected)
+
+    def _wp_editor_changed(self, *_args):
+        """Live-syncs the editor widgets into the selected preset's dict --
+        colors are written directly in _wp_pick_color, this handles shape/
+        slider changes. Nothing here touches disk; only Save (_wp_save)
+        does, so switching presets or closing without saving is safe."""
+        if not (0 <= self._wp_selected < len(self._wp_cfg["presets"])):
+            return
+        preset = self._wp_cfg["presets"][self._wp_selected]
+        preset["fill_shape"] = self._wp_shape_var.get()
+        preset["crawler_size"] = self._wp_size_var.get()
+        preset["gap"] = self._wp_gap_var.get()
+        preset["speed"] = self._wp_speed_var.get()
+
+    def _wp_pick_color(self, var, btn, title):
+        _rgb, hexval = colorchooser.askcolor(color=var.get(), title=title, parent=self._wallpaper_dialog)
+        if not hexval:
+            return  # user cancelled
+        var.set(hexval)
+        btn.config(background=hexval, activebackground=hexval, foreground=self._contrast_text_color(hexval))
+        if 0 <= self._wp_selected < len(self._wp_cfg["presets"]):
+            preset = self._wp_cfg["presets"][self._wp_selected]
+            preset["colors"] = [v.get() for v in self._wp_color_vars]
+            self._wp_listbox.itemconfig(self._wp_selected, background=preset["colors"][0],
+                                         foreground=self._contrast_text_color(preset["colors"][0]))
+
+    def _wp_pick_bg_color(self):
+        _rgb, hexval = colorchooser.askcolor(color=self._wp_bg_var.get(), title="Background color",
+                                              parent=self._wallpaper_dialog)
+        if not hexval:
+            return
+        self._wp_bg_var.set(hexval)
+        self._wp_bg_btn.config(background=hexval, activebackground=hexval,
+                                foreground=self._contrast_text_color(hexval))
+        self._wp_cfg["bg_color"] = hexval
+
+    def _wp_monitor_changed(self):
+        self._wp_cfg["monitor_mode"] = self._wp_monitor_var.get()
+
+    def _wp_add_preset(self):
+        base = WALLPAPER_DEFAULT_PRESETS[len(self._wp_cfg["presets"]) % len(WALLPAPER_DEFAULT_PRESETS)]
+        new_preset = dict(base)
+        new_preset["colors"] = list(base["colors"])
+        self._wp_cfg["presets"].append(new_preset)
+        self._wp_selected = len(self._wp_cfg["presets"]) - 1
+        self._wp_refresh_listbox()
+
+    def _wp_remove_preset(self):
+        presets = self._wp_cfg["presets"]
+        if len(presets) <= 1 or self._wp_selected < 0:
+            return  # always keep at least one preset -- the rotation can't be empty
+        del presets[self._wp_selected]
+        self._wp_selected = min(self._wp_selected, len(presets) - 1)
+        self._wp_cfg["rotation_index"] = min(self._wp_cfg.get("rotation_index", 0), len(presets) - 1)
+        self._wp_refresh_listbox()
+
+    def _wp_move_preset(self, direction):
+        presets = self._wp_cfg["presets"]
+        i = self._wp_selected
+        j = i + direction
+        if i < 0 or not (0 <= j < len(presets)):
+            return
+        presets[i], presets[j] = presets[j], presets[i]
+        self._wp_selected = j
+        self._wp_refresh_listbox()
+
+    def _wp_copy_from_generator(self):
+        """Grabs whatever is currently dialed in on the main Color crawl
+        controls (colors, crawler size/gap/speed) plus the main Fill shape
+        picker, and writes it into the selected wallpaper preset -- the
+        easiest way to turn a look you already like into a wallpaper day."""
+        if not (0 <= self._wp_selected < len(self._wp_cfg["presets"])):
+            return
+        shape = self.fill_shape_var.get()
+        preset = self._wp_cfg["presets"][self._wp_selected]
+        preset["fill_shape"] = shape if shape in WALLPAPER_SHAPE_CHOICES else "square"
+        preset["colors"] = [v.get() for v in self.crawl_color_vars]
+        preset["crawler_size"] = self.crawler_size_var.get()
+        preset["gap"] = self.crawl_gap_var.get()
+        preset["speed"] = self.crawl_speed_var.get()
+        self._wp_load_editor(self._wp_selected)
+        self._wp_listbox.itemconfig(self._wp_selected, background=preset["colors"][0],
+                                     foreground=self._contrast_text_color(preset["colors"][0]))
+
+    def _wp_save(self, silent=False):
+        save_wallpaper_config(self._wp_cfg)
+        self._wp_saved_snapshot = json.dumps(self._wp_cfg, sort_keys=True)
+        if not silent:
+            messagebox.showinfo("Saved", "Wallpaper settings saved.", parent=self._wallpaper_dialog)
+
+    def _wp_start(self):
+        self._wp_save(silent=True)  # what starts should match what's shown, not a stale on-disk
+        # copy -- silent because a blocking confirmation here would just be
+        # an unwanted interruption between clicking Start and it launching
+        if self._wallpaper_proc is not None and self._wallpaper_proc.poll() is None:
+            messagebox.showinfo("Already running",
+                                 "A wallpaper process started from here is already running -- "
+                                 "stop it first if you want to restart with new settings.",
+                                 parent=self._wallpaper_dialog)
+            return
+        try:
+            kwargs = {}
+            if sys.platform == "win32":
+                kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+            self._wallpaper_proc = subprocess.Popen(
+                [sys.executable, str(WALLPAPER_ENGINE_PATH)],
+                cwd=str(WALLPAPER_ENGINE_PATH.parent), **kwargs,
+            )
+        except OSError as e:
+            messagebox.showerror("Could not start", str(e), parent=self._wallpaper_dialog)
+            return
+        self._wp_update_run_buttons()
+        self._wp_poll_process()
+
+    def _wp_stop(self):
+        if self._wallpaper_proc is None or self._wallpaper_proc.poll() is not None:
+            self._wallpaper_proc = None
+            self._wp_update_run_buttons()
+            return
+        self._wallpaper_proc.terminate()
+        try:
+            self._wallpaper_proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            self._wallpaper_proc.kill()
+        self._wallpaper_proc = None
+        self._wp_update_run_buttons()
+
+    def _wp_poll_process(self):
+        """Reschedules itself only while a process we started is still
+        alive, so it notices (and reflects in the Status label/buttons) if
+        the wallpaper process crashes or is closed some other way."""
+        if self._wallpaper_proc is not None and self._wallpaper_proc.poll() is None:
+            self.after(2000, self._wp_poll_process)
+        else:
+            self._wallpaper_proc = None
+            self._wp_update_run_buttons()
+
+    def _wp_update_run_buttons(self):
+        running = self._wallpaper_proc is not None and self._wallpaper_proc.poll() is None
+        self._wallpaper_status_var.set(f"Running (pid {self._wallpaper_proc.pid})" if running else "Not running")
+        if self._wallpaper_dialog is not None and self._wallpaper_dialog.winfo_exists():
+            self._wp_start_btn.config(state="disabled" if running else "normal")
+            self._wp_stop_btn.config(state="normal" if running else "disabled")
 
 
 if __name__ == "__main__":
