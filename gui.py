@@ -25,6 +25,12 @@ path instantly instead of re-running the ~seconds-to-a-minute generation.
 Display stroke is capped so it can never thicken the line enough to make it
 touch itself; see organic_curve.max_safe_render_stroke().
 
+Width/Height support a rectangular canvas (e.g. a 1920x1080 wallpaper),
+filled edge-to-edge with no cropping; "Square" links them together for the
+original single-size behavior. "Draw custom boundary..." lets you hand-draw
+a closed shape on the preview before generating, which is then filled
+instead of a preset shape.
+
 Run with the same interpreter you used for organic_curve.py, e.g.:
     .venv\\Scripts\\python.exe gui.py          (Windows)
     .venv/bin/python gui.py                    (macOS/Linux)
@@ -40,6 +46,7 @@ from pathlib import Path
 from tkinter import colorchooser, ttk, filedialog, messagebox
 
 from PIL import ImageTk
+from shapely.geometry import Polygon as ShapelyPolygon
 
 from organic_curve import (generate, render_png, render_svg, GenerationError,
                             max_safe_render_stroke, fill_polygon, FILL_SHAPES)
@@ -66,6 +73,12 @@ class CurveApp(tk.Tk):
         self._gen_token = 0      # invalidates a stale/superseded animation when a new run starts
         self._anim_skip = False  # set by the Skip button to jump the running animation to the end
         self._rerendering = False  # guards against overlapping color/stroke re-renders
+
+        # Custom drawn-boundary state (fill_shape='custom').
+        self.custom_region = None   # finalized Shapely Polygon, in full generation-space coords
+        self.custom_points = []     # raw (canvas_x, canvas_y) points while a stroke is in progress
+        self._draw_mode = False     # armed: next drag on the preview canvas draws a boundary
+        self._drawing = False       # a drag is currently in progress
 
         OUTPUT_DIR.mkdir(exist_ok=True)
 
@@ -109,6 +122,11 @@ class CurveApp(tk.Tk):
             scale = ttk.Scale(parent, from_=frm, to=to, variable=var, command=lambda _v: on_move())
             scale.grid(row=row, column=0, sticky="ew")
             row += 1
+            # The scale's `command` (and hence the value label) only fires on
+            # user drag, not on a programmatic var.set() -- expose a manual
+            # refresh so code that sets the variable directly (presets, the
+            # width/height link) can keep the label in sync too.
+            scale.refresh_label = lambda v=var, l=val_label, f=fmt: l.config(text=f.format(v.get()))
             return scale
 
         ttk.Label(parent, text="Flowing Curve Generator", font=("", 13, "bold")).grid(
@@ -129,17 +147,46 @@ class CurveApp(tk.Tk):
         ttk.Label(parent, text="Fill shape").grid(row=row, column=0, sticky="w", pady=(8, 0))
         row += 1
         self.fill_shape_var = tk.StringVar(value="square")
-        shape_combo = ttk.Combobox(parent, textvariable=self.fill_shape_var, values=list(FILL_SHAPES),
-                                    state="readonly", width=12)
-        shape_combo.grid(row=row, column=0, columnspan=2, sticky="w")
-        shape_combo.bind("<<ComboboxSelected>>", self._update_shape_preview)
+        self.shape_combo = ttk.Combobox(parent, textvariable=self.fill_shape_var, values=list(FILL_SHAPES),
+                                         state="readonly", width=12)
+        self.shape_combo.grid(row=row, column=0, columnspan=2, sticky="w")
+        self.shape_combo.bind("<<ComboboxSelected>>", self._on_shape_selected)
+        row += 1
+
+        draw_row = ttk.Frame(parent)
+        draw_row.grid(row=row, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+        row += 1
+        self.draw_btn = ttk.Button(draw_row, text="Draw custom boundary...", command=self._toggle_draw_mode)
+        self.draw_btn.pack(side="left")
+        self.clear_draw_btn = ttk.Button(draw_row, text="Clear", command=self._clear_custom_boundary,
+                                          state="disabled")
+        self.clear_draw_btn.pack(side="left", padx=(6, 0))
+        ttk.Label(parent, text="Draws on the preview, at the current width/height.",
+                  foreground="#666").grid(row=row, column=0, columnspan=2, sticky="w", pady=(0, 4))
         row += 1
 
         # --- Frame size (needs a regenerate: changes the actual geometry) ---
-        self.size_var = tk.IntVar(value=1200)
-        self.size_scale = add_slider("Frame size (px)", self.size_var, 200, 2000, 50, "{:.0f}")
-        self.size_scale.bind("<ButtonRelease-1>", self._update_shape_preview)
-        ttk.Label(parent, text="1200px takes ~30-60s to generate. Try\n500-600 while experimenting.",
+        self.link_wh_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(parent, text="Square (link width/height)", variable=self.link_wh_var,
+                         command=self._on_link_toggle).grid(row=row, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        row += 1
+        self.width_var = tk.IntVar(value=1200)
+        self.height_var = tk.IntVar(value=1200)
+        self.width_scale = add_slider("Width (px)", self.width_var, 200, 3000, 10, "{:.0f}")
+        self.width_scale.bind("<ButtonRelease-1>", self._on_frame_size_changed)
+        self.height_scale = add_slider("Height (px)", self.height_var, 200, 3000, 10, "{:.0f}")
+        self.height_scale.bind("<ButtonRelease-1>", self._on_frame_size_changed)
+        self.height_scale.config(state="disabled")  # linked by default; width drives both
+        self.width_var.trace_add("write", self._on_width_changed)
+
+        preset_row = ttk.Frame(parent)
+        preset_row.grid(row=row, column=0, columnspan=2, sticky="w")
+        row += 1
+        ttk.Button(preset_row, text="1920x1080", width=10,
+                   command=lambda: self._set_wh(1920, 1080)).pack(side="left")
+        ttk.Button(preset_row, text="Square 1200", width=10,
+                   command=lambda: self._set_wh(1200, 1200)).pack(side="left", padx=(6, 0))
+        ttk.Label(parent, text="1200px square takes ~30-60s. A full\n1920x1080 canvas can take a minute or two.",
                   foreground="#666").grid(row=row, column=0, columnspan=2, sticky="w", pady=(0, 4))
         row += 1
 
@@ -272,25 +319,68 @@ class CurveApp(tk.Tk):
         self._placeholder_text_id = self.preview_canvas.create_text(
             PREVIEW_DISPLAY_SIZE / 2, PREVIEW_DISPLAY_SIZE / 2,
             text="Nothing generated yet", fill="#888")
+        self.preview_canvas.bind("<ButtonPress-1>", self._on_canvas_press)
+        self.preview_canvas.bind("<B1-Motion>", self._on_canvas_drag)
+        self.preview_canvas.bind("<ButtonRelease-1>", self._on_canvas_release)
 
         self.info_var = tk.StringVar(value="")
         ttk.Label(parent, textvariable=self.info_var, foreground="#444").grid(row=1, column=0, sticky="w", pady=(6, 0))
 
+    @staticmethod
+    def _preview_scale_offset(width, height):
+        """Map full generation-space (width x height) coordinates onto the
+        square on-screen preview canvas: uniformly scaled to fit (never
+        distorted) and centered, so a wide/tall rectangle gets letterboxed
+        within the box instead of stretched. On a square canvas this reduces
+        to exactly the old `PREVIEW_DISPLAY_SIZE / size` with zero offset."""
+        scale = min(PREVIEW_DISPLAY_SIZE / width, PREVIEW_DISPLAY_SIZE / height)
+        disp_w, disp_h = width * scale, height * scale
+        return scale, (PREVIEW_DISPLAY_SIZE - disp_w) / 2, (PREVIEW_DISPLAY_SIZE - disp_h) / 2
+
+    def _on_shape_selected(self, _evt=None):
+        # Picking a shape from the dropdown while a custom boundary exists
+        # abandons that boundary -- the dropdown and the drawn boundary are
+        # mutually exclusive ways of choosing what gets filled.
+        if self.fill_shape_var.get() != "custom" and self.custom_region is not None:
+            self.custom_region = None
+            self.custom_points = []
+            self.clear_draw_btn.config(state="disabled")
+        self._update_shape_preview()
+
     def _update_shape_preview(self, *_args):
         """Draw just the outline of the currently selected fill shape (at
-        the current frame size/edge clearance) on the canvas, so you can see
-        what a Generate would fill before spending the time to run one.
+        the current width/height/edge clearance) on the canvas, so you can
+        see what a Generate would fill before spending the time to run one.
         Whatever was previously generated no longer matches these settings,
         so this also resets the controls that depend on a live result."""
-        if self.busy:
-            return  # don't clobber a generation/animation in progress
+        if self.busy or self._drawing or self._draw_mode:
+            return  # don't clobber a generation/animation/draw-in-progress
         try:
-            size = self.size_var.get()
+            width = self.width_var.get()
+            height = self.height_var.get()
             edge = self.edge_var.get()
             shape = self.fill_shape_var.get()
-            region = fill_polygon(shape, size, edge)
-        except (tk.TclError, GenerationError):
-            return  # mid-edit / momentarily invalid combination -- leave the canvas as-is
+        except tk.TclError:
+            return  # mid-edit -- leave the canvas as-is
+
+        if shape == "custom":
+            if self.custom_region is not None:
+                self._redraw_custom_boundary_outline()
+            else:
+                self.preview_canvas.config(background=self.bg_color_var.get())
+                self.preview_canvas.delete("all")
+                self.preview_canvas.create_text(
+                    PREVIEW_DISPLAY_SIZE / 2, PREVIEW_DISPLAY_SIZE / 2,
+                    text='Click "Draw custom boundary..."\nand drag on this canvas',
+                    fill="#888", justify="center")
+                self.status_var.set("Ready.")
+                self.info_var.set("No boundary drawn yet.")
+            return
+
+        try:
+            region = fill_polygon(shape, (width, height), edge)
+        except GenerationError:
+            return  # momentarily invalid combination -- leave the canvas as-is
 
         self.last_path = None
         self.last_report = None
@@ -299,16 +389,173 @@ class CurveApp(tk.Tk):
         self.display_stroke_scale.config(state="disabled")
         self.display_stroke_label.config(text="--")
 
-        scale = PREVIEW_DISPLAY_SIZE / size
+        scale, off_x, off_y = self._preview_scale_offset(width, height)
         coords = []
         for x, y in region.exterior.coords:
-            coords.extend([x * scale, y * scale])
+            coords.extend([x * scale + off_x, y * scale + off_y])
 
         self.preview_canvas.config(background=self.bg_color_var.get())
         self.preview_canvas.delete("all")
         self.preview_canvas.create_polygon(coords, outline="#888888", fill="", width=2, dash=(5, 3))
         self.status_var.set("Ready.")
         self.info_var.set(f"Shape preview: {shape}. Click Generate to fill it.")
+
+    # ------------------------------------------------------ width/height ----
+
+    def _on_link_toggle(self):
+        if self.link_wh_var.get():
+            self.height_var.set(self.width_var.get())
+            self.height_scale.config(state="disabled")
+        else:
+            self.height_scale.config(state="normal")
+        self.height_scale.refresh_label()
+        self._on_frame_size_changed()
+
+    def _on_width_changed(self, *_args):
+        if not self.link_wh_var.get():
+            return
+        try:
+            w = self.width_var.get()
+        except tk.TclError:
+            return
+        if self.height_var.get() != w:
+            self.height_var.set(w)
+        self.height_scale.refresh_label()
+
+    def _set_wh(self, w, h):
+        square = (w == h)
+        self.link_wh_var.set(square)
+        self.height_scale.config(state="disabled" if square else "normal")
+        self.width_var.set(w)
+        self.height_var.set(h)
+        self.width_scale.refresh_label()
+        self.height_scale.refresh_label()
+        self._on_frame_size_changed()
+
+    def _on_frame_size_changed(self, _evt=None):
+        # A drawn boundary is tied to the width/height it was drawn at; once
+        # the canvas size changes it no longer lines up, so drop it rather
+        # than silently filling a stale/mismatched shape.
+        if self.custom_region is not None:
+            self._clear_custom_boundary()
+        else:
+            self._update_shape_preview()
+
+    # --------------------------------------------------- draw custom shape ----
+
+    def _toggle_draw_mode(self):
+        if self.busy:
+            return
+        if self._draw_mode:
+            self._draw_mode = False
+            self._drawing = False
+            self.draw_btn.config(text="Draw custom boundary...")
+            if self.custom_region is None:
+                self.shape_combo.config(state="readonly")
+                self.fill_shape_var.set("square")
+            self._update_shape_preview()
+            return
+        self._draw_mode = True
+        self.custom_points = []
+        self.fill_shape_var.set("custom")
+        self.shape_combo.config(state="disabled")
+        self.draw_btn.config(text="Drawing... (click to cancel)")
+        self.status_var.set("Click and drag on the preview to draw your boundary; release to finish.")
+        self.preview_canvas.config(background=self.bg_color_var.get())
+        self.preview_canvas.delete("all")
+        self.preview_canvas.create_text(PREVIEW_DISPLAY_SIZE / 2, PREVIEW_DISPLAY_SIZE / 2,
+                                         text="Click and drag to draw a boundary", fill="#888", justify="center")
+
+    def _on_canvas_press(self, event):
+        if not self._draw_mode or self.busy:
+            return
+        self._drawing = True
+        self.custom_points = [(event.x, event.y)]
+        self.preview_canvas.delete("draw_stroke")
+
+    def _on_canvas_drag(self, event):
+        if not self._drawing:
+            return
+        last = self.custom_points[-1]
+        if (event.x - last[0]) ** 2 + (event.y - last[1]) ** 2 >= 4:  # skip near-duplicate points
+            self.preview_canvas.create_line(last[0], last[1], event.x, event.y,
+                                             fill="#ffcc66", width=2, tags="draw_stroke")
+            self.custom_points.append((event.x, event.y))
+
+    def _on_canvas_release(self, _event):
+        if not self._drawing:
+            return
+        self._drawing = False
+        self._draw_mode = False
+        self.draw_btn.config(text="Draw custom boundary...")
+        if len(self.custom_points) < 3:
+            self.status_var.set('Boundary too short -- click "Draw custom boundary..." and try a longer stroke.')
+            self.custom_points = []
+            self.shape_combo.config(state="readonly")
+            self.fill_shape_var.set("square")
+            self._update_shape_preview()
+            return
+        self._finalize_custom_boundary()
+
+    def _finalize_custom_boundary(self):
+        try:
+            width, height = self.width_var.get(), self.height_var.get()
+        except tk.TclError:
+            width, height = 1200, 1200
+        scale, off_x, off_y = self._preview_scale_offset(width, height)
+        full_pts = [((cx - off_x) / scale, (cy - off_y) / scale) for cx, cy in self.custom_points]
+        full_pts = [(min(max(x, 0), width), min(max(y, 0), height)) for x, y in full_pts]
+        try:
+            poly = ShapelyPolygon(full_pts)
+            if not poly.is_valid:
+                poly = poly.buffer(0)
+            if poly.is_empty or poly.geom_type != "Polygon" or poly.area < 1000:
+                raise ValueError("boundary too small/degenerate")
+        except Exception:
+            messagebox.showerror(
+                "Boundary not usable",
+                "That stroke didn't form a clean closed shape. Try drawing a simpler loop.")
+            self.custom_points = []
+            self.preview_canvas.delete("draw_stroke")
+            self.shape_combo.config(state="readonly")
+            self.fill_shape_var.set("square")
+            self._update_shape_preview()
+            return
+        self.custom_region = poly
+        self.custom_points = []
+        self.clear_draw_btn.config(state="normal")
+        self._redraw_custom_boundary_outline()
+
+    def _redraw_custom_boundary_outline(self):
+        width, height = self.width_var.get(), self.height_var.get()
+        scale, off_x, off_y = self._preview_scale_offset(width, height)
+        coords = []
+        for x, y in self.custom_region.exterior.coords:
+            coords.extend([x * scale + off_x, y * scale + off_y])
+
+        self.last_path = None
+        self.last_report = None
+        self.save_btn.config(state="disabled")
+        self.replay_btn.config(state="disabled")
+        self.display_stroke_scale.config(state="disabled")
+        self.display_stroke_label.config(text="--")
+
+        self.preview_canvas.config(background=self.bg_color_var.get())
+        self.preview_canvas.delete("all")
+        self.preview_canvas.create_polygon(coords, outline="#ffcc66", fill="", width=2, dash=(5, 3))
+        self.status_var.set("Ready.")
+        self.info_var.set("Custom boundary ready. Click Generate to fill it.")
+
+    def _clear_custom_boundary(self):
+        if self.busy:
+            return
+        self.custom_region = None
+        self.custom_points = []
+        self.clear_draw_btn.config(state="disabled")
+        self.shape_combo.config(state="readonly")
+        if self.fill_shape_var.get() == "custom":
+            self.fill_shape_var.set("square")
+        self._update_shape_preview()
 
     def _toggle_advanced(self):
         if self.advanced_visible.get():
@@ -324,9 +571,16 @@ class CurveApp(tk.Tk):
     def _start_generate(self):
         if self.busy:
             return
+        shape = self.fill_shape_var.get()
+        if shape == "custom" and self.custom_region is None:
+            messagebox.showerror(
+                "No boundary drawn",
+                'Fill shape is set to "custom" but no boundary has been drawn yet. '
+                'Click "Draw custom boundary..." and drag on the preview, or pick a different shape.')
+            return
         try:
             params = dict(
-                size=self.size_var.get(),
+                size=(self.width_var.get(), self.height_var.get()),
                 gap=self.gap_var.get(),
                 preferred_gap=self.preferred_gap_var.get(),
                 iterations=self.iterations_var.get(),
@@ -336,8 +590,10 @@ class CurveApp(tk.Tk):
                 edge=self.edge_var.get(),
                 seed=self.seed_var.get(),
                 attempts=self.attempts_var.get(),
-                fill_shape=self.fill_shape_var.get(),
+                fill_shape=shape,
             )
+            if shape == "custom":
+                params["custom_region"] = self.custom_region
         except tk.TclError:
             messagebox.showerror("Invalid input", "One of the fields isn't a valid number.")
             return
@@ -435,9 +691,11 @@ class CurveApp(tk.Tk):
         svg_path.write_text(svg_text)
         json_path.write_text(json.dumps(report, indent=2))
 
+        canvas_w = report.get("canvas_width", img.size[0])
+        canvas_h = report.get("canvas_height", img.size[1])
         self.info_var.set(
             f"seed={report['seed']}  shape={report.get('fill_shape', 'square')}  "
-            f"min gap={report['minimum_nonlocal_ink_gap_px']}px  "
+            f"{canvas_w:.0f}x{canvas_h:.0f}px  min gap={report['minimum_nonlocal_ink_gap_px']}px  "
             f"coverage={report['covered_fraction']*100:.0f}%  saved to outputs/{PREVIEW_BASENAME}.png"
         )
 
@@ -451,12 +709,15 @@ class CurveApp(tk.Tk):
     def _animate_draw(self, p, size, stroke, final_img):
         """Progressively reveal the already-computed path on the canvas, like
         watching it get drawn. Purely playback -- the path/image were already
-        fully computed and validated before this runs."""
+        fully computed and validated before this runs. `size` is a
+        (width, height) pair; the path is fit-to-box and centered exactly
+        like the shape-border preview, so it lines up with it."""
         token = self._gen_token
+        width, height = size
         self.preview_canvas.config(background=self.bg_color_var.get())
         self.preview_canvas.delete("all")
-        scale = PREVIEW_DISPLAY_SIZE / size
-        coords = (p * scale).flatten().tolist()  # x0,y0,x1,y1,...
+        scale, off_x, off_y = self._preview_scale_offset(width, height)
+        coords = ((p * scale) + [off_x, off_y]).flatten().tolist()  # x0,y0,x1,y1,...
         n_points = len(coords) // 2
         if n_points < 2:
             self._show_preview(final_img)

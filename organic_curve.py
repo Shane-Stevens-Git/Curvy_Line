@@ -52,65 +52,121 @@ class GenerationError(Exception):
     """Raised when no valid curve could be produced for the given parameters."""
 
 
-FILL_SHAPES = ('square', 'circle', 'triangle', 'diamond', 'pentagon', 'hexagon', 'octagon', 'star')
+FILL_SHAPES = ('square', 'circle', 'triangle', 'diamond', 'pentagon', 'hexagon', 'octagon', 'star', 'custom')
 
 
-def _regular_polygon(n_sides, size, edge, rotation_deg=-90.0):
-    """A regular n-sided polygon inscribed in the incircle of the inset
-    square (the same inset area every fill shape uses). rotation_deg places
-    the first vertex; -90 puts it at the top of the canvas."""
-    lo, hi = edge, size - edge
-    cx = cy = size / 2.0
-    r = (hi - lo) / 2.0
+def _wh(size):
+    """Normalize a `size` argument into an explicit (width, height) pair.
+
+    `size` may be a single number, meaning a square canvas (the original,
+    still-default behavior -- kept so every existing caller that passes a
+    plain size keeps working unchanged), or a (width, height) pair for a
+    non-square canvas. Always returns floats.
+    """
+    if isinstance(size, (tuple, list)):
+        if len(size) != 2:
+            raise GenerationError('size must be a single number or a (width, height) pair.')
+        return float(size[0]), float(size[1])
+    return float(size), float(size)
+
+
+def _regular_polygon(size, edge, n_sides, rotation_deg=-90.0):
+    """A regular n-sided polygon inscribed in the inset canvas rectangle's
+    incircle/inellipse (the same inset area every fill shape uses).
+    rotation_deg places the first vertex; -90 puts it at the top of the
+    canvas. On a square canvas (width == height) this is a true regular
+    polygon, bit-for-bit the same as before rectangle support existed; on a
+    non-square canvas the vertices are stretched per-axis so the shape still
+    reaches every inset edge instead of leaving letterboxed empty space.
+    """
+    width, height = _wh(size)
+    lo_x, hi_x = edge, width - edge
+    lo_y, hi_y = edge, height - edge
+    cx, cy = width / 2.0, height / 2.0
+    rx = (hi_x - lo_x) / 2.0
+    ry = (hi_y - lo_y) / 2.0
     angles = np.deg2rad(rotation_deg) + np.arange(n_sides) * (2 * np.pi / n_sides)
-    return Polygon(np.column_stack([cx + r * np.cos(angles), cy + r * np.sin(angles)]))
+    return Polygon(np.column_stack([cx + rx * np.cos(angles), cy + ry * np.sin(angles)]))
 
 
-def _star_polygon(n_points, size, edge, inner_ratio=0.55, rotation_deg=-90.0):
+def _star_polygon(size, edge, n_points, inner_ratio=0.55, rotation_deg=-90.0):
     """A simple n-pointed star: vertices alternate between an outer radius
-    (touching the incircle of the inset square, like the other regular
-    shapes) and an inner radius. inner_ratio is kept fairly high (fatter
-    arms, less razor-thin points) since very thin points leave little room
-    for the ink-spacing/edge-clearance requirements every shape shares."""
-    lo, hi = edge, size - edge
-    cx = cy = size / 2.0
-    r_outer = (hi - lo) / 2.0
-    r_inner = r_outer * inner_ratio
+    (touching the inset rectangle's incircle/inellipse, like the other
+    regular shapes) and an inner radius. inner_ratio is kept fairly high
+    (fatter arms, less razor-thin points) since very thin points leave
+    little room for the ink-spacing/edge-clearance requirements every shape
+    shares. Stretched per-axis on a non-square canvas, same as
+    _regular_polygon; bit-for-bit unchanged on a square one.
+    """
+    width, height = _wh(size)
+    lo_x, hi_x = edge, width - edge
+    lo_y, hi_y = edge, height - edge
+    cx, cy = width / 2.0, height / 2.0
+    rx_outer = (hi_x - lo_x) / 2.0
+    ry_outer = (hi_y - lo_y) / 2.0
+    rx_inner = rx_outer * inner_ratio
+    ry_inner = ry_outer * inner_ratio
     step = np.pi / n_points
     angles = np.deg2rad(rotation_deg) + np.arange(2 * n_points) * step
-    radii = np.where(np.arange(2 * n_points) % 2 == 0, r_outer, r_inner)
-    return Polygon(np.column_stack([cx + radii * np.cos(angles), cy + radii * np.sin(angles)]))
+    outer = np.arange(2 * n_points) % 2 == 0
+    rx = np.where(outer, rx_outer, rx_inner)
+    ry = np.where(outer, ry_outer, ry_inner)
+    return Polygon(np.column_stack([cx + rx * np.cos(angles), cy + ry * np.sin(angles)]))
 
 
-def fill_polygon(fill_shape, size, edge):
+def fill_polygon(fill_shape, size, edge, custom_region=None):
     """The region the curve must stay within, already inset by `edge` from
-    the canvas border. 'square' is exactly the original behavior. Every
-    other shape is a simple alternative inscribed in that same inset area,
-    so `edge`/`gap`/`stroke` all mean the same thing regardless of shape.
+    the canvas border. `size` is a single number for a square canvas or a
+    (width, height) pair for a rectangle -- see _wh(). 'square' fills the
+    whole inset canvas (a true rectangle when width != height, which is how
+    a wallpaper-sized canvas gets filled edge-to-edge with no cropping
+    needed). Every other preset shape is a simple alternative inscribed in
+    that same inset area, so `edge`/`gap`/`stroke` all mean the same thing
+    regardless of shape. 'custom' uses the caller-supplied `custom_region`
+    (a Shapely Polygon in canvas pixel coordinates, e.g. a boundary the user
+    hand-drew in the GUI) instead of a preset shape, inset by `edge` from
+    both its own outline and the canvas border.
     """
-    lo, hi = edge, size - edge
-    if hi <= lo:
-        raise GenerationError(f'edge={edge} leaves no room inside a {size}px canvas.')
+    width, height = _wh(size)
+    lo_x, hi_x = edge, width - edge
+    lo_y, hi_y = edge, height - edge
+    if hi_x <= lo_x or hi_y <= lo_y:
+        raise GenerationError(f'edge={edge} leaves no room inside a {width:.0f}x{height:.0f}px canvas.')
+    if fill_shape == 'custom':
+        if custom_region is None:
+            raise GenerationError("fill_shape='custom' requires custom_region (a Shapely Polygon).")
+        canvas_box = box(0, 0, width, height)
+        inset = custom_region.intersection(canvas_box).buffer(-edge)
+        region = inset.intersection(box(lo_x, lo_y, hi_x, hi_y))
+        if region.is_empty or region.geom_type != 'Polygon' or region.area < 9 * edge * edge:
+            raise GenerationError(
+                'The drawn boundary is too small or too thin once inset by the edge clearance; '
+                'draw a larger/rounder shape or reduce --edge.'
+            )
+        return region
     if fill_shape == 'square':
-        return box(lo, lo, hi, hi)
-    cx = cy = size / 2.0
+        return box(lo_x, lo_y, hi_x, hi_y)
+    cx, cy = width / 2.0, height / 2.0
+    rx, ry = (hi_x - lo_x) / 2.0, (hi_y - lo_y) / 2.0
     if fill_shape == 'circle':
-        radius = (hi - lo) / 2.0
-        return Point(cx, cy).buffer(radius, quad_segs=128)
+        if width == height:
+            return Point(cx, cy).buffer(rx, quad_segs=128)
+        theta = np.linspace(0, 2 * np.pi, 256, endpoint=False)
+        return Polygon(np.column_stack([cx + rx * np.cos(theta), cy + ry * np.sin(theta)]))
     if fill_shape == 'triangle':
-        # Upward-pointing triangle filling the inset square: apex at top
+        # Upward-pointing triangle filling the inset rectangle: apex at top
         # center, base spanning the full inset width at the bottom.
-        return Polygon([(cx, lo), (lo, hi), (hi, hi)])
+        return Polygon([(cx, lo_y), (lo_x, hi_y), (hi_x, hi_y)])
     if fill_shape == 'diamond':
-        return _regular_polygon(4, size, edge)
+        return _regular_polygon(size, edge, 4)
     if fill_shape == 'pentagon':
-        return _regular_polygon(5, size, edge)
+        return _regular_polygon(size, edge, 5)
     if fill_shape == 'hexagon':
-        return _regular_polygon(6, size, edge)
+        return _regular_polygon(size, edge, 6)
     if fill_shape == 'octagon':
-        return _regular_polygon(8, size, edge, rotation_deg=-90 + 22.5)
+        return _regular_polygon(size, edge, 8, rotation_deg=-90 + 22.5)
     if fill_shape == 'star':
-        return _star_polygon(5, size, edge)
+        return _star_polygon(size, edge, 5)
     raise GenerationError(f"Unknown fill_shape {fill_shape!r}; expected one of {FILL_SHAPES}.")
 
 
@@ -136,6 +192,7 @@ def resample(p, step=2):
 
 
 def candidate(size, gap, stroke, edge, seed, fill_shape, region):
+    width, height = _wh(size)
     rng = np.random.default_rng(seed)
     pitch = (gap + stroke) * 3.2
     radius = pitch * 0.245
@@ -143,18 +200,23 @@ def candidate(size, gap, stroke, edge, seed, fill_shape, region):
     if fill_shape == 'square':
         # Exact original fast path (no region/rejection-sampling machinery):
         # keeps the seed -> curve mapping identical to before this shape
-        # generalization existed, for everyone already using the default.
+        # generalization existed, for everyone already using the default
+        # (still true bit-for-bit on a square canvas; a rectangular canvas
+        # just uses independent x/y bounds instead of one shared lo/hi).
         margin = edge + stroke / 2 + radius + 8
-        lo, hi = margin, size - margin
-        if hi - lo < 3 * pitch:
+        lo_x, hi_x = margin, width - margin
+        lo_y, hi_y = margin, height - margin
+        if hi_x - lo_x < 3 * pitch or hi_y - lo_y < 3 * pitch:
             raise GenerationError(
                 f'Canvas is too small for this spacing: with gap={gap}, stroke={stroke}, '
-                f'edge={edge}, size must be at least {int(3 * pitch + 2 * margin)} px '
-                f'(got {size} px). Increase --size or reduce --gap/--edge.'
+                f'edge={edge}, both dimensions must be at least {int(3 * pitch + 2 * margin)} px '
+                f'(got {width:.0f}x{height:.0f} px). Increase --size/--width/--height or reduce --gap/--edge.'
             )
+        lo = np.array([lo_x, lo_y])
+        hi = np.array([hi_x, hi_y])
         sites = [rng.uniform(lo, hi, 2)]
         # Best-candidate scattering fills empty areas without a lattice.
-        for _ in range(int((hi-lo)**2 / pitch**2 * 1.5)):
+        for _ in range(int((hi_x-lo_x)*(hi_y-lo_y) / pitch**2 * 1.5)):
             choices = rng.uniform(lo, hi, (180, 2))
             d = cdist(choices, sites).min(axis=1)
             if d.max() < pitch * 0.80:
@@ -162,16 +224,17 @@ def candidate(size, gap, stroke, edge, seed, fill_shape, region):
             sites.append(choices[d.argmax()])
         sites = np.array(sites)
     else:
-        # General path for circle/triangle (any convex or non-convex fill
-        # polygon): erode the region so the inflated tree (buffer radius)
-        # plus stroke never crosses the shape's own boundary, then scatter
-        # by rejection sampling within it instead of a plain uniform range.
+        # General path for circle/triangle/.../custom (any convex or
+        # non-convex fill polygon): erode the region so the inflated tree
+        # (buffer radius) plus stroke never crosses the shape's own
+        # boundary, then scatter by rejection sampling within it instead of
+        # a plain uniform range.
         site_region = region.buffer(-(stroke / 2 + radius + 8))
         if site_region.is_empty or site_region.area < 9 * pitch * pitch:
             raise GenerationError(
                 f'Canvas/shape is too small for this spacing: with gap={gap}, stroke={stroke}, '
-                f'edge={edge}, the fill area has too little room (got {size} px canvas, '
-                f'fill_shape={fill_shape!r}). Increase --size, reduce --gap/--edge, or pick '
+                f'edge={edge}, the fill area has too little room (got {width:.0f}x{height:.0f} px canvas, '
+                f'fill_shape={fill_shape!r}). Increase the canvas size, reduce --gap/--edge, or pick '
                 f'a less constrained --fill-shape.'
             )
         prepare(site_region)
@@ -219,17 +282,21 @@ def candidate(size, gap, stroke, edge, seed, fill_shape, region):
 
 
 def validate(p, size, gap, stroke, edge, region=None, geometry_only=False):
+    width, height = _wh(size)
     if region is None:
-        region = box(edge, edge, size-edge, size-edge)  # original square-only default
+        region = box(edge, edge, width-edge, height-edge)  # original square-only default
     line = LineString(p)
     if not line.is_simple:
         return None
-    # Distance to the raw canvas border (0/size px), independent of fill
-    # shape -- lets every shape report a comparable "how close to the image
-    # edge did the ink get" figure, exactly like the original square-only
-    # check (mathematically equivalent to the old min(p.min(), size-p.max())
-    # shortcut for well-spread curves, just computed exactly per point).
-    edge_actual = float(np.min(np.minimum(p, size - p))) - stroke / 2
+    # Distance to the raw canvas border (0/width or 0/height px per axis),
+    # independent of fill shape -- lets every shape report a comparable "how
+    # close to the image edge did the ink get" figure, exactly like the
+    # original square-only check (bit-identical to it when width == height:
+    # same min() over the same per-point, per-axis values, just grouped by
+    # axis first instead of flattened all at once).
+    dist_x = np.minimum(p[:, 0], width - p[:, 0])
+    dist_y = np.minimum(p[:, 1], height - p[:, 1])
+    edge_actual = float(np.min(np.minimum(dist_x, dist_y))) - stroke / 2
     if edge_actual < edge:
         return None
     # The path must also stay within the fill shape itself. For 'square'
@@ -286,10 +353,16 @@ def soften_boundary(p, size, gap, stroke, edge, seed, amplitude, region=None, fi
 
     Only implemented for the 'square' fill shape so far -- the bending here
     is defined relative to 4 straight canvas-parallel edges, which doesn't
-    generalize to a circle's curved boundary or a triangle's angled ones.
-    For other shapes this is a no-op (edge_wave has no effect), noted in the
-    returned report rather than failing.
+    generalize to a circle's curved boundary, a polygon's angled ones, or an
+    arbitrary hand-drawn 'custom' boundary. For other shapes this is a no-op
+    (edge_wave has no effect), noted in the returned report rather than
+    failing. 'square' itself now means "fill the whole inset canvas", which
+    can be a true rectangle when width != height -- the wave math below
+    already works per-axis, so edge-wave still bends all 4 sides on a
+    rectangular canvas exactly as it does on a square one, just with
+    independent width/height instead of one shared size.
     """
+    width, height = _wh(size)
     if amplitude == 0 or fill_shape != 'square':
         note = None if fill_shape == 'square' else (
             f"edge-wave boundary bending isn't implemented for fill_shape={fill_shape!r} yet; "
@@ -298,13 +371,16 @@ def soften_boundary(p, size, gap, stroke, edge, seed, amplitude, region=None, fi
         return p, dict(requested_amplitude_px=amplitude, accepted_amplitude_px=0, note=note)
     rng = np.random.default_rng(seed+941)
     phases = rng.uniform(0, 2*np.pi, (4, 2))
-    wavelength = max(100., size*0.14)
-    band = max(70., size*0.085)
+    dims = (width, height)
+    min_dim = min(width, height)
+    wavelength = max(100., min_dim*0.14)
+    band = max(70., min_dim*0.085)
     displacement = np.zeros_like(p)
     for side in range(4):
         axis = side//2
         sign = 1 if side%2 == 0 else -1
-        depth = p[:, axis]-edge if sign == 1 else size-edge-p[:, axis]
+        dim = dims[axis]
+        depth = p[:, axis]-edge if sign == 1 else dim-edge-p[:, axis]
         along = p[:, 1-axis]
         wave = (0.52 + 0.32*np.sin(2*np.pi*along/wavelength+phases[side,0])
                 + 0.16*np.sin(2*np.pi*along/(wavelength*1.73)+phases[side,1]))
@@ -406,31 +482,44 @@ def relax(p, size, gap, stroke, edge, preferred_gap, iterations, region, smoothn
 
 def generate(size=1200, gap=12.0, preferred_gap=18.0, iterations=50, smoothness=1.0,
              edge_wave=20.0, stroke=3.0, edge=35.0, seed=17, attempts=60,
-             fill_shape='square', progress_callback=None):
+             fill_shape='square', progress_callback=None, custom_region=None):
     """Run the full pipeline and return (path, report) without any file I/O
     or argparse/CLI involvement, so it can be called directly (e.g. from a GUI)
     many times in the same process instead of spawning a subprocess per call.
 
+    size is a single number for a square canvas (original behavior,
+    unchanged) or a (width, height) pair to fill a true rectangle -- e.g. a
+    monitor resolution -- edge-to-edge with no cropping needed.
+
     fill_shape selects the region the curve fills, inscribed in the usual
-    edge-inset area: 'square' (default, original behavior), 'circle', or
-    'triangle'. gap/preferred_gap/stroke/edge/smoothness all mean the same
-    thing regardless of shape. edge_wave boundary bending is currently only
+    edge-inset area: 'square' (default; the whole inset canvas -- a
+    rectangle when width != height), a preset shape ('circle', 'triangle',
+    'diamond', 'pentagon', 'hexagon', 'octagon', 'star'), or 'custom' to fill
+    a caller-supplied boundary instead (pass it as custom_region, a Shapely
+    Polygon in canvas pixel coordinates -- e.g. one the user hand-drew in the
+    GUI). gap/preferred_gap/stroke/edge/smoothness all mean the same thing
+    regardless of shape. edge_wave boundary bending is currently only
     implemented for 'square' (see soften_boundary); it's silently skipped
     for the other shapes.
 
     Raises GenerationError (never a raw ValueError/traceback) if no valid
     curve could be produced for the given parameters.
     """
+    width, height = _wh(size)
     if not np.isfinite(smoothness) or not 0.25 <= smoothness <= 3:
         raise GenerationError('smoothness must be a finite number between 0.25 and 3.')
-    if min(size, gap, stroke, edge, attempts) <= 0:
-        raise GenerationError('size, gap, stroke, edge, and attempts must be positive.')
+    if min(width, height, gap, stroke, edge, attempts) <= 0:
+        raise GenerationError('size (width/height), gap, stroke, edge, and attempts must be positive.')
     if preferred_gap < gap or iterations < 0 or edge_wave < 0:
         raise GenerationError('preferred_gap must be >= gap; iterations and edge_wave must be >= 0.')
     if fill_shape not in FILL_SHAPES:
         raise GenerationError(f'fill_shape must be one of {FILL_SHAPES}, got {fill_shape!r}.')
+    if fill_shape == 'custom' and custom_region is None:
+        raise GenerationError("fill_shape='custom' requires custom_region (a Shapely Polygon in canvas pixel coordinates).")
+    if fill_shape != 'custom' and custom_region is not None:
+        raise GenerationError("custom_region was given but fill_shape isn't 'custom'; set fill_shape='custom' to use it.")
 
-    region = fill_polygon(fill_shape, size, edge)
+    region = fill_polygon(fill_shape, size, edge, custom_region=custom_region)
     prepare(region)
 
     report = None
@@ -455,7 +544,7 @@ def generate(size=1200, gap=12.0, preferred_gap=18.0, iterations=50, smoothness=
     else:
         raise GenerationError(
             f'No candidate passed after {attempts} attempts with fill_shape={fill_shape!r}. '
-            f'Try more --attempts, a larger --size, a smaller --gap, or a less constrained shape.'
+            f'Try more --attempts, a larger canvas, a smaller --gap, or a less constrained shape.'
         )
 
     p, optimization = relax(p, size, gap, stroke, edge, preferred_gap, iterations,
@@ -467,6 +556,8 @@ def generate(size=1200, gap=12.0, preferred_gap=18.0, iterations=50, smoothness=
         raise GenerationError('Final validation failed; try different parameters.')
     report.update(final_report)
     report['fill_shape'] = fill_shape
+    report['canvas_width'] = width
+    report['canvas_height'] = height
     report['optimization'] = optimization
     report['boundary_bending'] = boundary
     report['final_empty_space'] = empty_space_stats(p, probe_grid(region, step=6.0, inset=3.0), stroke)
@@ -482,19 +573,30 @@ def render_png(p, size, stroke, scale=4, line_color='#ffffff', bg_color='#000000
     max_safe_render_stroke() for the ceiling on how thick stroke can safely
     go before the line would visually touch itself.
     """
-    img = Image.new('RGB', (size*scale, size*scale), bg_color)
+    width, height = _wh(size)
+    w, h = round(width), round(height)
+    img = Image.new('RGB', (w*scale, h*scale), bg_color)
     draw = ImageDraw.Draw(img)
     draw.line([tuple(q*scale) for q in p], fill=line_color, width=round(stroke*scale), joint='curve')
     for x, y in p[[0, -1]] * scale:
         r = stroke * scale / 2
         draw.ellipse((x-r, y-r, x+r, y+r), fill=line_color)
-    return img.resize((size, size), Image.Resampling.LANCZOS)
+    return img.resize((w, h), Image.Resampling.LANCZOS)
+
+
+def _fmt_dim(n):
+    """Format a canvas dimension for SVG markup: no trailing '.0' for a
+    whole-pixel value (matches the original viewBox="0 0 {size} {size}"
+    formatting exactly when size was an int), a few decimals otherwise."""
+    return str(int(n)) if float(n).is_integer() else f'{n:.4f}'
 
 
 def render_svg(p, size, stroke, line_color='#111111', bg_color='#faf9f5'):
     """Return SVG markup for the path as a string. Pure function: no file I/O."""
+    width, height = _wh(size)
+    w, h = _fmt_dim(width), _fmt_dim(height)
     d = 'M ' + ' L '.join(f'{x:.4f},{y:.4f}' for x, y in p)
-    return (f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {size} {size}">'
+    return (f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {w} {h}">'
             f'<rect width="100%" height="100%" fill="{bg_color}"/>'
             f'<path d="{d}" fill="none" stroke="{line_color}" stroke-width="{stroke}" '
             f'stroke-linecap="round" stroke-linejoin="round"/></svg>')
@@ -515,7 +617,12 @@ def max_safe_render_stroke(report, generation_stroke, margin=0.5):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument('--size', type=int, default=1200)
+    ap.add_argument('--size', type=int, default=1200,
+                    help='Square canvas size in px. Ignored if --width/--height are both given.')
+    ap.add_argument('--width', type=int, default=None,
+                    help='Canvas width in px, for a non-square/rectangular canvas. Requires --height too.')
+    ap.add_argument('--height', type=int, default=None,
+                    help='Canvas height in px, for a non-square/rectangular canvas. Requires --width too.')
     ap.add_argument('--gap', type=float, default=12)
     ap.add_argument('--preferred-gap', type=float, default=18,
                     help='Soft ink spacing target, not a hard maximum')
@@ -529,13 +636,20 @@ def main():
     ap.add_argument('--seed', type=int, default=17)
     ap.add_argument('--attempts', type=int, default=60)
     ap.add_argument('--fill-shape', choices=FILL_SHAPES, default='square',
-                    help="Region the curve fills, inscribed in the usual edge-inset area. "
-                         "edge-wave boundary bending is currently 'square'-only.")
+                    help="Region the curve fills, inscribed in the usual edge-inset area. 'square' "
+                         "fills the whole canvas (a rectangle if --width/--height differ). 'custom' "
+                         "isn't usable from the CLI (no way to supply a boundary) -- it's for library/GUI "
+                         "callers that pass custom_region directly. edge-wave boundary bending is "
+                         "currently 'square'-only.")
     ap.add_argument('--output', default='organic_curve.png')
     a = ap.parse_args()
 
+    if (a.width is None) != (a.height is None):
+        ap.error('--width and --height must be given together.')
+    size_arg = (a.width, a.height) if a.width is not None else a.size
+
     try:
-        p, report = generate(size=a.size, gap=a.gap, preferred_gap=a.preferred_gap,
+        p, report = generate(size=size_arg, gap=a.gap, preferred_gap=a.preferred_gap,
                               iterations=a.iterations, smoothness=a.smoothness,
                               edge_wave=a.edge_wave, stroke=a.stroke, edge=a.edge,
                               seed=a.seed, attempts=a.attempts, fill_shape=a.fill_shape)
@@ -543,8 +657,8 @@ def main():
         ap.error(str(e))
 
     out = Path(a.output)
-    render_png(p, a.size, a.stroke).save(out)
-    out.with_suffix('.svg').write_text(render_svg(p, a.size, a.stroke))
+    render_png(p, size_arg, a.stroke).save(out)
+    out.with_suffix('.svg').write_text(render_svg(p, size_arg, a.stroke))
     out.with_suffix('.validation.json').write_text(json.dumps(report, indent=2))
     print(json.dumps(report, indent=2))
 
