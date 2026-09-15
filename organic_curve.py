@@ -11,6 +11,11 @@ hard ink gap, 18 px soft preferred ink gap, 3 px stroke, 35 px edge clearance.
 Nearby portions of the same bend are excluded from self-spacing tests using
 a documented arc-length neighborhood; intersections are never excluded.
 
+Fills a square by default; --fill-shape circle/triangle inscribes the same
+algorithm in a circle or triangle within the usual edge-inset area instead.
+edge-wave boundary bending is currently square-only and is skipped (noted in
+the report, not an error) for the other shapes.
+
 CLI usage: python organic_curve.py --gap 12 --preferred-gap 18 --iterations 50
 Use --smoothness 1.5 for rounder curves (1 is the original strength;
 supported range 0.25 to 3). Higher values can reduce density. Smoothing is
@@ -36,13 +41,54 @@ from scipy.spatial.distance import cdist
 from scipy.spatial import cKDTree
 from scipy.sparse.csgraph import minimum_spanning_tree
 from scipy.ndimage import gaussian_filter1d
-from shapely.geometry import LineString, MultiLineString, box
-from shapely import STRtree, linestrings, distance as geometric_distance
+from shapely.geometry import LineString, MultiLineString, Point, Polygon, box
+from shapely import (STRtree, linestrings, distance as geometric_distance,
+                      points as shapely_points, contains as geometric_contains,
+                      covers as geometric_covers, prepare)
 from PIL import Image, ImageDraw
 
 
 class GenerationError(Exception):
     """Raised when no valid curve could be produced for the given parameters."""
+
+
+FILL_SHAPES = ('square', 'circle', 'triangle')
+
+
+def fill_polygon(fill_shape, size, edge):
+    """The region the curve must stay within, already inset by `edge` from
+    the canvas border. 'square' is exactly the original behavior. 'circle'
+    and 'triangle' are simple alternative shapes inscribed in that same
+    inset area, so `edge`/`gap`/`stroke` all mean the same thing regardless
+    of shape.
+    """
+    lo, hi = edge, size - edge
+    if hi <= lo:
+        raise GenerationError(f'edge={edge} leaves no room inside a {size}px canvas.')
+    if fill_shape == 'square':
+        return box(lo, lo, hi, hi)
+    cx = cy = size / 2.0
+    if fill_shape == 'circle':
+        radius = (hi - lo) / 2.0
+        return Point(cx, cy).buffer(radius, quad_segs=128)
+    if fill_shape == 'triangle':
+        # Upward-pointing triangle filling the inset square: apex at top
+        # center, base spanning the full inset width at the bottom.
+        return Polygon([(cx, lo), (lo, hi), (hi, hi)])
+    raise GenerationError(f"Unknown fill_shape {fill_shape!r}; expected one of {FILL_SHAPES}.")
+
+
+def probe_grid(region, step=6.0, inset=3.0):
+    """A grid of points spanning region's bounding box, kept only where they
+    fall inside region. Used to sense empty space without ever letting the
+    path be pulled toward areas outside the target fill shape."""
+    minx, miny, maxx, maxy = region.bounds
+    axis_x = np.arange(minx + inset, maxx, step)
+    axis_y = np.arange(miny + inset, maxy, step)
+    probes = np.stack(np.meshgrid(axis_x, axis_y), axis=-1).reshape(-1, 2)
+    if len(probes) == 0:
+        return probes
+    return probes[geometric_contains(region, shapely_points(probes))]
 
 
 def resample(p, step=2):
@@ -53,27 +99,73 @@ def resample(p, step=2):
     return np.column_stack([np.interp(s, arc, p[:, j]) for j in (0, 1)])
 
 
-def candidate(size, gap, stroke, edge, seed):
+def candidate(size, gap, stroke, edge, seed, fill_shape, region):
     rng = np.random.default_rng(seed)
     pitch = (gap + stroke) * 3.2
     radius = pitch * 0.245
-    margin = edge + stroke / 2 + radius + 8
-    lo, hi = margin, size - margin
-    if hi - lo < 3 * pitch:
-        raise GenerationError(
-            f'Canvas is too small for this spacing: with gap={gap}, stroke={stroke}, '
-            f'edge={edge}, size must be at least {int(3 * pitch + 2 * margin)} px '
-            f'(got {size} px). Increase --size or reduce --gap/--edge.'
-        )
-    sites = [rng.uniform(lo, hi, 2)]
-    # Best-candidate scattering fills empty areas without a lattice.
-    for _ in range(int((hi-lo)**2 / pitch**2 * 1.5)):
-        choices = rng.uniform(lo, hi, (180, 2))
-        d = cdist(choices, sites).min(axis=1)
-        if d.max() < pitch * 0.80:
-            break
-        sites.append(choices[d.argmax()])
-    sites = np.array(sites)
+
+    if fill_shape == 'square':
+        # Exact original fast path (no region/rejection-sampling machinery):
+        # keeps the seed -> curve mapping identical to before this shape
+        # generalization existed, for everyone already using the default.
+        margin = edge + stroke / 2 + radius + 8
+        lo, hi = margin, size - margin
+        if hi - lo < 3 * pitch:
+            raise GenerationError(
+                f'Canvas is too small for this spacing: with gap={gap}, stroke={stroke}, '
+                f'edge={edge}, size must be at least {int(3 * pitch + 2 * margin)} px '
+                f'(got {size} px). Increase --size or reduce --gap/--edge.'
+            )
+        sites = [rng.uniform(lo, hi, 2)]
+        # Best-candidate scattering fills empty areas without a lattice.
+        for _ in range(int((hi-lo)**2 / pitch**2 * 1.5)):
+            choices = rng.uniform(lo, hi, (180, 2))
+            d = cdist(choices, sites).min(axis=1)
+            if d.max() < pitch * 0.80:
+                break
+            sites.append(choices[d.argmax()])
+        sites = np.array(sites)
+    else:
+        # General path for circle/triangle (any convex or non-convex fill
+        # polygon): erode the region so the inflated tree (buffer radius)
+        # plus stroke never crosses the shape's own boundary, then scatter
+        # by rejection sampling within it instead of a plain uniform range.
+        site_region = region.buffer(-(stroke / 2 + radius + 8))
+        if site_region.is_empty or site_region.area < 9 * pitch * pitch:
+            raise GenerationError(
+                f'Canvas/shape is too small for this spacing: with gap={gap}, stroke={stroke}, '
+                f'edge={edge}, the fill area has too little room (got {size} px canvas, '
+                f'fill_shape={fill_shape!r}). Increase --size, reduce --gap/--edge, or pick '
+                f'a less constrained --fill-shape.'
+            )
+        prepare(site_region)
+        minx, miny, maxx, maxy = site_region.bounds
+
+        def sample_inside(n):
+            pts = rng.uniform([minx, miny], [maxx, maxy], (n, 2))
+            return pts[geometric_contains(site_region, shapely_points(pts))]
+
+        first = sample_inside(64)
+        tries = 0
+        while len(first) == 0 and tries < 40:
+            first = sample_inside(64)
+            tries += 1
+        if len(first) == 0:
+            return None
+        sites = [first[0]]
+        # Best-candidate scattering fills empty areas without a lattice.
+        for _ in range(int(site_region.area / pitch**2 * 1.5)):
+            choices = sample_inside(180)
+            if len(choices) == 0:
+                continue
+            d = cdist(choices, sites).min(axis=1)
+            if d.max() < pitch * 0.80:
+                break
+            sites.append(choices[d.argmax()])
+        sites = np.array(sites)
+        if len(sites) < 4:
+            return None
+
     mst = minimum_spanning_tree(cdist(sites, sites)).tocoo()
     tree = MultiLineString([[sites[i], sites[j]] for i, j in zip(mst.row, mst.col)])
     shape = tree.buffer(radius, quad_segs=24)
@@ -90,12 +182,27 @@ def candidate(size, gap, stroke, edge, seed):
     return resample(p), len(sites)
 
 
-def validate(p, size, gap, stroke, edge, geometry_only=False):
+def validate(p, size, gap, stroke, edge, region=None, geometry_only=False):
+    if region is None:
+        region = box(edge, edge, size-edge, size-edge)  # original square-only default
     line = LineString(p)
     if not line.is_simple:
         return None
-    edge_actual = min(p.min(), size-p.max()) - stroke/2
+    # Distance to the raw canvas border (0/size px), independent of fill
+    # shape -- lets every shape report a comparable "how close to the image
+    # edge did the ink get" figure, exactly like the original square-only
+    # check (mathematically equivalent to the old min(p.min(), size-p.max())
+    # shortcut for well-spread curves, just computed exactly per point).
+    edge_actual = float(np.min(np.minimum(p, size - p))) - stroke / 2
     if edge_actual < edge:
+        return None
+    # The path must also stay within the fill shape itself. For 'square'
+    # this is implied by the check above (region is exactly that inset
+    # box); for 'circle'/'triangle', region is smaller than the surrounding
+    # inset square, so this is the check that actually constrains the fill
+    # area to the chosen shape. covers() (not contains()) so a point that
+    # lands exactly on the shape's boundary isn't spuriously rejected.
+    if not geometric_covers(region, shapely_points(p)).all():
         return None
     segs = linestrings(np.stack([p[:-1], p[1:]], axis=1))
     arc = np.r_[0, np.cumsum(np.linalg.norm(np.diff(p, axis=0), axis=1))]
@@ -112,7 +219,6 @@ def validate(p, size, gap, stroke, edge, geometry_only=False):
         return None
     if geometry_only:
         return True
-    region = box(edge, edge, size-edge, size-edge)
     coverage = line.buffer((gap+stroke)*1.6).intersection(region).area / region.area
     if coverage < 0.70:
         return None
@@ -135,15 +241,25 @@ def empty_space_stats(p, probes, stroke):
                 path_length_px=round(float(LineString(p).length), 1))
 
 
-def soften_boundary(p, size, gap, stroke, edge, seed, amplitude):
+def soften_boundary(p, size, gap, stroke, edge, seed, amplitude, region=None, fill_shape='square'):
     """Replace ruler-like boundary runs with smooth, nonperiodic-looking bends.
 
     Nearby sections move together in a smooth spatial field, rather than
     adding independent noisy wiggles to each vertex. Displacement points
     inward and fades into the interior. Every candidate is checked exactly.
+
+    Only implemented for the 'square' fill shape so far -- the bending here
+    is defined relative to 4 straight canvas-parallel edges, which doesn't
+    generalize to a circle's curved boundary or a triangle's angled ones.
+    For other shapes this is a no-op (edge_wave has no effect), noted in the
+    returned report rather than failing.
     """
-    if amplitude == 0:
-        return p, dict(requested_amplitude_px=0, accepted_amplitude_px=0)
+    if amplitude == 0 or fill_shape != 'square':
+        note = None if fill_shape == 'square' else (
+            f"edge-wave boundary bending isn't implemented for fill_shape={fill_shape!r} yet; "
+            f"skipped (no effect on this curve)."
+        )
+        return p, dict(requested_amplitude_px=amplitude, accepted_amplitude_px=0, note=note)
     rng = np.random.default_rng(seed+941)
     phases = rng.uniform(0, 2*np.pi, (4, 2))
     wavelength = max(100., size*0.14)
@@ -160,24 +276,26 @@ def soften_boundary(p, size, gap, stroke, edge, seed, amplitude):
         displacement[:, axis] += sign*influence*wave
     for fraction in (1., .8, .6, .4, .2):
         trial = np.round(resample(p+amplitude*fraction*displacement, step=.75), 4)
-        if validate(trial, size, gap, stroke, edge, geometry_only=True):
+        if validate(trial, size, gap, stroke, edge, region, geometry_only=True):
             return trial, dict(requested_amplitude_px=amplitude,
                                accepted_amplitude_px=amplitude*fraction,
                                wavelength_px=wavelength, influence_band_px=band)
     raise GenerationError('Boundary rounding could not preserve clearance; reduce --edge-wave.')
 
 
-def relax(p, size, gap, stroke, edge, preferred_gap, iterations, smoothness=1.0, progress_callback=None):
+def relax(p, size, gap, stroke, edge, preferred_gap, iterations, region, smoothness=1.0, progress_callback=None):
     """Redistribute into voids, repel crowded sections, and smooth curvature.
 
     The probe lattice senses space only; it does not define the drawn path.
     Longer deformed segments are resampled so added arc length remains smooth.
     Each accepted step passes exact segment collision/clearance checks.
     progress_callback(phase, current, total), when given, is called instead
-    of printing so a GUI can drive its own progress bar.
+    of printing so a GUI can drive its own progress bar. probes are drawn
+    from `region` so voids outside the target fill shape never pull the path
+    toward them (matters for circle/triangle, where region is smaller than
+    its own bounding box).
     """
-    axis = np.arange(edge+3, size-edge, 6.0)
-    probes = np.stack(np.meshgrid(axis, axis), axis=-1).reshape(-1, 2)
+    probes = probe_grid(region, step=6.0, inset=3.0)
     before = empty_space_stats(p, probes, stroke)
     accepted = 0
     target = preferred_gap + stroke
@@ -216,7 +334,7 @@ def relax(p, size, gap, stroke, edge, preferred_gap, iterations, smoothness=1.0,
         motion *= np.clip(taper, 0, 1)[:,None]
         for scale in (1, 0.5, 0.25, 0.125, 0.0625):
             trial = np.round(resample(p+motion*scale), 4)
-            if validate(trial, size, gap, stroke, edge, geometry_only=True):
+            if validate(trial, size, gap, stroke, edge, region, geometry_only=True):
                 p = trial
                 accepted += 1
                 break
@@ -239,7 +357,7 @@ def relax(p, size, gap, stroke, edge, preferred_gap, iterations, smoothness=1.0,
         taper = np.clip(np.minimum(np.arange(len(p)), np.arange(len(p))[::-1])/24, 0, 1)
         polished = p+(polished-p)*taper[:,None]
         trial = np.round(resample(polished, step=0.75), 4)
-        if validate(trial, size, gap, stroke, edge, geometry_only=True):
+        if validate(trial, size, gap, stroke, edge, region, geometry_only=True):
             p = trial
             polish_sigma = sigma
             break
@@ -252,10 +370,17 @@ def relax(p, size, gap, stroke, edge, preferred_gap, iterations, smoothness=1.0,
 
 def generate(size=1200, gap=12.0, preferred_gap=18.0, iterations=50, smoothness=1.0,
              edge_wave=20.0, stroke=3.0, edge=35.0, seed=17, attempts=60,
-             progress_callback=None):
+             fill_shape='square', progress_callback=None):
     """Run the full pipeline and return (path, report) without any file I/O
     or argparse/CLI involvement, so it can be called directly (e.g. from a GUI)
     many times in the same process instead of spawning a subprocess per call.
+
+    fill_shape selects the region the curve fills, inscribed in the usual
+    edge-inset area: 'square' (default, original behavior), 'circle', or
+    'triangle'. gap/preferred_gap/stroke/edge/smoothness all mean the same
+    thing regardless of shape. edge_wave boundary bending is currently only
+    implemented for 'square' (see soften_boundary); it's silently skipped
+    for the other shapes.
 
     Raises GenerationError (never a raw ValueError/traceback) if no valid
     curve could be produced for the given parameters.
@@ -266,10 +391,15 @@ def generate(size=1200, gap=12.0, preferred_gap=18.0, iterations=50, smoothness=
         raise GenerationError('size, gap, stroke, edge, and attempts must be positive.')
     if preferred_gap < gap or iterations < 0 or edge_wave < 0:
         raise GenerationError('preferred_gap must be >= gap; iterations and edge_wave must be >= 0.')
+    if fill_shape not in FILL_SHAPES:
+        raise GenerationError(f'fill_shape must be one of {FILL_SHAPES}, got {fill_shape!r}.')
+
+    region = fill_polygon(fill_shape, size, edge)
+    prepare(region)
 
     report = None
     for attempt in range(attempts):
-        result = candidate(size, gap, stroke, edge, seed+attempt)
+        result = candidate(size, gap, stroke, edge, seed+attempt, fill_shape, region)
         if result is None:
             if progress_callback:
                 progress_callback('search', attempt+1, attempts)
@@ -277,9 +407,9 @@ def generate(size=1200, gap=12.0, preferred_gap=18.0, iterations=50, smoothness=
         p, sites = result
         # Quantize before testing: SVG and PNG use exactly these coordinates.
         p = np.round(p, 4)
-        candidate_report = validate(p, size, gap, stroke, edge)
+        candidate_report = validate(p, size, gap, stroke, edge, region)
         if candidate_report:
-            candidate_report.update(seed=seed+attempt, requested_seed=seed, sites=sites)
+            candidate_report.update(seed=seed+attempt, requested_seed=seed, sites=sites, fill_shape=fill_shape)
             report = candidate_report
             break
         if progress_callback:
@@ -288,22 +418,22 @@ def generate(size=1200, gap=12.0, preferred_gap=18.0, iterations=50, smoothness=
             print(f'Rejected attempt {attempt+1}', flush=True)
     else:
         raise GenerationError(
-            f'No candidate passed after {attempts} attempts. Try more --attempts, '
-            f'a larger --size, or a smaller --gap.'
+            f'No candidate passed after {attempts} attempts with fill_shape={fill_shape!r}. '
+            f'Try more --attempts, a larger --size, a smaller --gap, or a less constrained shape.'
         )
 
     p, optimization = relax(p, size, gap, stroke, edge, preferred_gap, iterations,
-                             smoothness, progress_callback=progress_callback)
-    p, boundary = soften_boundary(p, size, gap, stroke, edge, report['seed'], edge_wave)
-    final_report = validate(p, size, gap, stroke, edge)
+                             region, smoothness, progress_callback=progress_callback)
+    p, boundary = soften_boundary(p, size, gap, stroke, edge, report['seed'], edge_wave,
+                                   region=region, fill_shape=fill_shape)
+    final_report = validate(p, size, gap, stroke, edge, region)
     if not final_report:
         raise GenerationError('Final validation failed; try different parameters.')
     report.update(final_report)
+    report['fill_shape'] = fill_shape
     report['optimization'] = optimization
     report['boundary_bending'] = boundary
-    axis = np.arange(edge+3, size-edge, 6.)
-    probes = np.stack(np.meshgrid(axis, axis), axis=-1).reshape(-1, 2)
-    report['final_empty_space'] = empty_space_stats(p, probes, stroke)
+    report['final_empty_space'] = empty_space_stats(p, probe_grid(region, step=6.0, inset=3.0), stroke)
     return p, report
 
 
@@ -362,6 +492,9 @@ def main():
     ap.add_argument('--edge', type=float, default=35)
     ap.add_argument('--seed', type=int, default=17)
     ap.add_argument('--attempts', type=int, default=60)
+    ap.add_argument('--fill-shape', choices=FILL_SHAPES, default='square',
+                    help="Region the curve fills, inscribed in the usual edge-inset area. "
+                         "edge-wave boundary bending is currently 'square'-only.")
     ap.add_argument('--output', default='organic_curve.png')
     a = ap.parse_args()
 
@@ -369,7 +502,7 @@ def main():
         p, report = generate(size=a.size, gap=a.gap, preferred_gap=a.preferred_gap,
                               iterations=a.iterations, smoothness=a.smoothness,
                               edge_wave=a.edge_wave, stroke=a.stroke, edge=a.edge,
-                              seed=a.seed, attempts=a.attempts)
+                              seed=a.seed, attempts=a.attempts, fill_shape=a.fill_shape)
     except GenerationError as e:
         ap.error(str(e))
 
