@@ -11,7 +11,7 @@ hard ink gap, 18 px soft preferred ink gap, 3 px stroke, 35 px edge clearance.
 Nearby portions of the same bend are excluded from self-spacing tests using
 a documented arc-length neighborhood; intersections are never excluded.
 
-Usage: python organic_curve.py --gap 12 --preferred-gap 18 --iterations 50
+CLI usage: python organic_curve.py --gap 12 --preferred-gap 18 --iterations 50
 Use --smoothness 1.5 for rounder curves (1 is the original strength;
 supported range 0.25 to 3). Higher values can reduce density. Smoothing is
 reduced automatically if necessary to preserve the spacing constraints.
@@ -20,6 +20,13 @@ The soft target is not a promised maximum: space/shape constraints may prevent
 reaching it everywhere. --iterations 0 disables relaxation (but not polishing).
 Requires Shapely 2.x. The report measures empty space on a 6 px probe lattice;
 those sampled distances are not exact global empty-circle bounds.
+
+Library usage: import generate(), render_png(), render_svg() to drive this
+from other Python code (e.g. a GUI) without going through the CLI or a
+subprocess. generate() takes an optional progress_callback(phase, current,
+total) so a caller can show a progress bar instead of the CLI's print output.
+A bad parameter/size combination raises GenerationError with a clear message
+instead of letting a ValueError traceback escape.
 """
 import argparse
 import json
@@ -32,6 +39,10 @@ from scipy.ndimage import gaussian_filter1d
 from shapely.geometry import LineString, MultiLineString, box
 from shapely import STRtree, linestrings, distance as geometric_distance
 from PIL import Image, ImageDraw
+
+
+class GenerationError(Exception):
+    """Raised when no valid curve could be produced for the given parameters."""
 
 
 def resample(p, step=2):
@@ -49,7 +60,11 @@ def candidate(size, gap, stroke, edge, seed):
     margin = edge + stroke / 2 + radius + 8
     lo, hi = margin, size - margin
     if hi - lo < 3 * pitch:
-        raise ValueError('Canvas is too small for this spacing.')
+        raise GenerationError(
+            f'Canvas is too small for this spacing: with gap={gap}, stroke={stroke}, '
+            f'edge={edge}, size must be at least {int(3 * pitch + 2 * margin)} px '
+            f'(got {size} px). Increase --size or reduce --gap/--edge.'
+        )
     sites = [rng.uniform(lo, hi, 2)]
     # Best-candidate scattering fills empty areas without a lattice.
     for _ in range(int((hi-lo)**2 / pitch**2 * 1.5)):
@@ -149,15 +164,17 @@ def soften_boundary(p, size, gap, stroke, edge, seed, amplitude):
             return trial, dict(requested_amplitude_px=amplitude,
                                accepted_amplitude_px=amplitude*fraction,
                                wavelength_px=wavelength, influence_band_px=band)
-    raise RuntimeError('Boundary rounding could not preserve clearance; reduce --edge-wave.')
+    raise GenerationError('Boundary rounding could not preserve clearance; reduce --edge-wave.')
 
 
-def relax(p, size, gap, stroke, edge, preferred_gap, iterations, smoothness=1.0):
+def relax(p, size, gap, stroke, edge, preferred_gap, iterations, smoothness=1.0, progress_callback=None):
     """Redistribute into voids, repel crowded sections, and smooth curvature.
 
     The probe lattice senses space only; it does not define the drawn path.
     Longer deformed segments are resampled so added arc length remains smooth.
     Each accepted step passes exact segment collision/clearance checks.
+    progress_callback(phase, current, total), when given, is called instead
+    of printing so a GUI can drive its own progress bar.
     """
     axis = np.arange(edge+3, size-edge, 6.0)
     probes = np.stack(np.meshgrid(axis, axis), axis=-1).reshape(-1, 2)
@@ -204,7 +221,10 @@ def relax(p, size, gap, stroke, edge, preferred_gap, iterations, smoothness=1.0)
                 accepted += 1
                 break
         if iteration % 10 == 9:
-            print(f'Relaxation {iteration+1}/{iterations}: {accepted} safe steps', flush=True)
+            if progress_callback:
+                progress_callback('relax', iteration+1, iterations)
+            else:
+                print(f'Relaxation {iteration+1}/{iterations}: {accepted} safe steps', flush=True)
     # Remove small force-field ripples with a broad Gaussian finishing pass.
     # Try the smoothest version first and back off if it crowds another bend.
     polish_sigma = 0
@@ -230,6 +250,83 @@ def relax(p, size, gap, stroke, edge, preferred_gap, iterations, smoothness=1.0)
                    preferred_ink_gap_px=preferred_gap, probe_grid_step_px=6)
 
 
+def generate(size=1200, gap=12.0, preferred_gap=18.0, iterations=50, smoothness=1.0,
+             edge_wave=20.0, stroke=3.0, edge=35.0, seed=17, attempts=60,
+             progress_callback=None):
+    """Run the full pipeline and return (path, report) without any file I/O
+    or argparse/CLI involvement, so it can be called directly (e.g. from a GUI)
+    many times in the same process instead of spawning a subprocess per call.
+
+    Raises GenerationError (never a raw ValueError/traceback) if no valid
+    curve could be produced for the given parameters.
+    """
+    if not np.isfinite(smoothness) or not 0.25 <= smoothness <= 3:
+        raise GenerationError('smoothness must be a finite number between 0.25 and 3.')
+    if min(size, gap, stroke, edge, attempts) <= 0:
+        raise GenerationError('size, gap, stroke, edge, and attempts must be positive.')
+    if preferred_gap < gap or iterations < 0 or edge_wave < 0:
+        raise GenerationError('preferred_gap must be >= gap; iterations and edge_wave must be >= 0.')
+
+    report = None
+    for attempt in range(attempts):
+        result = candidate(size, gap, stroke, edge, seed+attempt)
+        if result is None:
+            if progress_callback:
+                progress_callback('search', attempt+1, attempts)
+            continue
+        p, sites = result
+        # Quantize before testing: SVG and PNG use exactly these coordinates.
+        p = np.round(p, 4)
+        candidate_report = validate(p, size, gap, stroke, edge)
+        if candidate_report:
+            candidate_report.update(seed=seed+attempt, requested_seed=seed, sites=sites)
+            report = candidate_report
+            break
+        if progress_callback:
+            progress_callback('search', attempt+1, attempts)
+        else:
+            print(f'Rejected attempt {attempt+1}', flush=True)
+    else:
+        raise GenerationError(
+            f'No candidate passed after {attempts} attempts. Try more --attempts, '
+            f'a larger --size, or a smaller --gap.'
+        )
+
+    p, optimization = relax(p, size, gap, stroke, edge, preferred_gap, iterations,
+                             smoothness, progress_callback=progress_callback)
+    p, boundary = soften_boundary(p, size, gap, stroke, edge, report['seed'], edge_wave)
+    final_report = validate(p, size, gap, stroke, edge)
+    if not final_report:
+        raise GenerationError('Final validation failed; try different parameters.')
+    report.update(final_report)
+    report['optimization'] = optimization
+    report['boundary_bending'] = boundary
+    axis = np.arange(edge+3, size-edge, 6.)
+    probes = np.stack(np.meshgrid(axis, axis), axis=-1).reshape(-1, 2)
+    report['final_empty_space'] = empty_space_stats(p, probes, stroke)
+    return p, report
+
+
+def render_png(p, size, stroke, scale=4):
+    """Return a PIL Image for the path. Pure function: no file I/O."""
+    img = Image.new('RGB', (size*scale, size*scale), '#000000')
+    draw = ImageDraw.Draw(img)
+    draw.line([tuple(q*scale) for q in p], fill='#ffffff', width=round(stroke*scale), joint='curve')
+    for x, y in p[[0, -1]] * scale:
+        r = stroke * scale / 2
+        draw.ellipse((x-r, y-r, x+r, y+r), fill='#ffffff')
+    return img.resize((size, size), Image.Resampling.LANCZOS)
+
+
+def render_svg(p, size, stroke):
+    """Return SVG markup for the path as a string. Pure function: no file I/O."""
+    d = 'M ' + ' L '.join(f'{x:.4f},{y:.4f}' for x, y in p)
+    return (f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {size} {size}">'
+            f'<rect width="100%" height="100%" fill="#faf9f5"/>'
+            f'<path d="{d}" fill="none" stroke="#111111" stroke-width="{stroke}" '
+            f'stroke-linecap="round" stroke-linejoin="round"/></svg>')
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--size', type=int, default=1200)
@@ -247,49 +344,18 @@ def main():
     ap.add_argument('--attempts', type=int, default=60)
     ap.add_argument('--output', default='organic_curve.png')
     a = ap.parse_args()
-    if not np.isfinite(a.smoothness) or not 0.25 <= a.smoothness <= 3:
-        ap.error('--smoothness must be a finite number between 0.25 and 3.')
-    if min(a.size, a.gap, a.stroke, a.edge, a.attempts) <= 0:
-        ap.error('Dimensions, gap, stroke, edge, and attempts must be positive.')
-    if a.preferred_gap < a.gap or a.iterations < 0 or a.edge_wave < 0:
-        ap.error('Preferred gap must be >= minimum gap; iterations and edge-wave must be >= 0.')
-    for attempt in range(a.attempts):
-        result = candidate(a.size, a.gap, a.stroke, a.edge, a.seed+attempt)
-        if result is None:
-            continue
-        p, sites = result
-        # Quantize before testing: SVG and PNG use exactly these coordinates.
-        p = np.round(p, 4)
-        report = validate(p, a.size, a.gap, a.stroke, a.edge)
-        if report:
-            report.update(seed=a.seed+attempt, requested_seed=a.seed, sites=sites)
-            break
-        print(f'Rejected attempt {attempt+1}', flush=True)
-    else:
-        raise RuntimeError('No candidate passed. No files written. Try more attempts or a larger canvas.')
-    p, optimization = relax(p, a.size, a.gap, a.stroke, a.edge, a.preferred_gap, a.iterations, a.smoothness)
-    p, boundary = soften_boundary(p, a.size, a.gap, a.stroke, a.edge,
-                                  report['seed'], a.edge_wave)
-    final_report = validate(p, a.size, a.gap, a.stroke, a.edge)
-    if not final_report:
-        raise RuntimeError('Final validation failed; no files written.')
-    report.update(final_report)
-    report['optimization'] = optimization
-    report['boundary_bending'] = boundary
-    axis = np.arange(a.edge+3, a.size-a.edge, 6.)
-    probes = np.stack(np.meshgrid(axis, axis), axis=-1).reshape(-1, 2)
-    report['final_empty_space'] = empty_space_stats(p, probes, a.stroke)
+
+    try:
+        p, report = generate(size=a.size, gap=a.gap, preferred_gap=a.preferred_gap,
+                              iterations=a.iterations, smoothness=a.smoothness,
+                              edge_wave=a.edge_wave, stroke=a.stroke, edge=a.edge,
+                              seed=a.seed, attempts=a.attempts)
+    except GenerationError as e:
+        ap.error(str(e))
+
     out = Path(a.output)
-    scale = 4
-    img = Image.new('RGB', (a.size*scale, a.size*scale), '#000000')
-    draw = ImageDraw.Draw(img)
-    draw.line([tuple(q*scale) for q in p], fill='#ffffff', width=round(a.stroke*scale), joint='curve')
-    for x, y in p[[0,-1]] * scale:
-        r = a.stroke * scale / 2
-        draw.ellipse((x-r,y-r,x+r,y+r), fill='#ffffff')
-    img.resize((a.size,a.size), Image.Resampling.LANCZOS).save(out)
-    d = 'M ' + ' L '.join(f'{x:.4f},{y:.4f}' for x,y in p)
-    out.with_suffix('.svg').write_text(f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {a.size} {a.size}"><rect width="100%" height="100%" fill="#faf9f5"/><path d="{d}" fill="none" stroke="#111111" stroke-width="{a.stroke}" stroke-linecap="round" stroke-linejoin="round"/></svg>')
+    render_png(p, a.size, a.stroke).save(out)
+    out.with_suffix('.svg').write_text(render_svg(p, a.size, a.stroke))
     out.with_suffix('.validation.json').write_text(json.dumps(report, indent=2))
     print(json.dumps(report, indent=2))
 
