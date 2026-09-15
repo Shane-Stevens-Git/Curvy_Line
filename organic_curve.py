@@ -52,15 +52,41 @@ class GenerationError(Exception):
     """Raised when no valid curve could be produced for the given parameters."""
 
 
-FILL_SHAPES = ('square', 'circle', 'triangle')
+FILL_SHAPES = ('square', 'circle', 'triangle', 'diamond', 'pentagon', 'hexagon', 'octagon', 'star')
+
+
+def _regular_polygon(n_sides, size, edge, rotation_deg=-90.0):
+    """A regular n-sided polygon inscribed in the incircle of the inset
+    square (the same inset area every fill shape uses). rotation_deg places
+    the first vertex; -90 puts it at the top of the canvas."""
+    lo, hi = edge, size - edge
+    cx = cy = size / 2.0
+    r = (hi - lo) / 2.0
+    angles = np.deg2rad(rotation_deg) + np.arange(n_sides) * (2 * np.pi / n_sides)
+    return Polygon(np.column_stack([cx + r * np.cos(angles), cy + r * np.sin(angles)]))
+
+
+def _star_polygon(n_points, size, edge, inner_ratio=0.55, rotation_deg=-90.0):
+    """A simple n-pointed star: vertices alternate between an outer radius
+    (touching the incircle of the inset square, like the other regular
+    shapes) and an inner radius. inner_ratio is kept fairly high (fatter
+    arms, less razor-thin points) since very thin points leave little room
+    for the ink-spacing/edge-clearance requirements every shape shares."""
+    lo, hi = edge, size - edge
+    cx = cy = size / 2.0
+    r_outer = (hi - lo) / 2.0
+    r_inner = r_outer * inner_ratio
+    step = np.pi / n_points
+    angles = np.deg2rad(rotation_deg) + np.arange(2 * n_points) * step
+    radii = np.where(np.arange(2 * n_points) % 2 == 0, r_outer, r_inner)
+    return Polygon(np.column_stack([cx + radii * np.cos(angles), cy + radii * np.sin(angles)]))
 
 
 def fill_polygon(fill_shape, size, edge):
     """The region the curve must stay within, already inset by `edge` from
-    the canvas border. 'square' is exactly the original behavior. 'circle'
-    and 'triangle' are simple alternative shapes inscribed in that same
-    inset area, so `edge`/`gap`/`stroke` all mean the same thing regardless
-    of shape.
+    the canvas border. 'square' is exactly the original behavior. Every
+    other shape is a simple alternative inscribed in that same inset area,
+    so `edge`/`gap`/`stroke` all mean the same thing regardless of shape.
     """
     lo, hi = edge, size - edge
     if hi <= lo:
@@ -75,6 +101,16 @@ def fill_polygon(fill_shape, size, edge):
         # Upward-pointing triangle filling the inset square: apex at top
         # center, base spanning the full inset width at the bottom.
         return Polygon([(cx, lo), (lo, hi), (hi, hi)])
+    if fill_shape == 'diamond':
+        return _regular_polygon(4, size, edge)
+    if fill_shape == 'pentagon':
+        return _regular_polygon(5, size, edge)
+    if fill_shape == 'hexagon':
+        return _regular_polygon(6, size, edge)
+    if fill_shape == 'octagon':
+        return _regular_polygon(8, size, edge, rotation_deg=-90 + 22.5)
+    if fill_shape == 'star':
+        return _star_polygon(5, size, edge)
     raise GenerationError(f"Unknown fill_shape {fill_shape!r}; expected one of {FILL_SHAPES}.")
 
 
