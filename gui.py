@@ -19,6 +19,12 @@ static image; "Skip" jumps straight to the finished frame. The animation is
 just a progressive reveal of the already-computed path for playback -- it
 does not change what gets generated, saved, or validated.
 
+Line color, background color, and "Display stroke" (after a generation) are
+pure presentation -- they redraw the already-computed, already-validated
+path instantly instead of re-running the ~seconds-to-a-minute generation.
+Display stroke is capped so it can never thicken the line enough to make it
+touch itself; see organic_curve.max_safe_render_stroke().
+
 Run with the same interpreter you used for organic_curve.py, e.g.:
     .venv\\Scripts\\python.exe gui.py          (Windows)
     .venv/bin/python gui.py                    (macOS/Linux)
@@ -31,11 +37,11 @@ import threading
 import time
 import tkinter as tk
 from pathlib import Path
-from tkinter import ttk, filedialog, messagebox
+from tkinter import colorchooser, ttk, filedialog, messagebox
 
 from PIL import ImageTk
 
-from organic_curve import generate, render_png, render_svg, GenerationError
+from organic_curve import generate, render_png, render_svg, GenerationError, max_safe_render_stroke
 
 OUTPUT_DIR = Path(__file__).parent / "outputs"
 PREVIEW_BASENAME = "preview"
@@ -54,9 +60,11 @@ class CurveApp(tk.Tk):
         self.last_report = None
         self.last_size = None
         self.last_stroke = None
+        self.last_generation_stroke = None
         self.preview_photo = None  # keep a reference so Tk doesn't garbage-collect it
         self._gen_token = 0      # invalidates a stale/superseded animation when a new run starts
         self._anim_skip = False  # set by the Skip button to jump the running animation to the end
+        self._rerendering = False  # guards against overlapping color/stroke re-renders
 
         OUTPUT_DIR.mkdir(exist_ok=True)
 
@@ -114,13 +122,58 @@ class CurveApp(tk.Tk):
         ttk.Entry(seed_frame, textvariable=self.seed_var, width=10).pack(side="left")
         ttk.Button(seed_frame, text="Random", command=self._randomize_seed).pack(side="left", padx=(6, 0))
 
-        # --- Stroke ---
+        # --- Frame size (needs a regenerate: changes the actual geometry) ---
+        self.size_var = tk.IntVar(value=1200)
+        add_slider("Frame size (px)", self.size_var, 200, 2000, 50, "{:.0f}")
+        ttk.Label(parent, text="1200px takes ~30-60s to generate. Try\n500-600 while experimenting.",
+                  foreground="#666").grid(row=row, column=0, columnspan=2, sticky="w", pady=(0, 4))
+        row += 1
+
+        # --- Stroke (generation-time: affects path spacing) ---
         self.stroke_var = tk.DoubleVar(value=3.0)
-        add_slider("Stroke width (px)", self.stroke_var, 1.0, 10.0, 0.5, "{:.1f}")
+        add_slider("Stroke width (px, at generation)", self.stroke_var, 1.0, 10.0, 0.5, "{:.1f}")
 
         # --- Smoothness ---
         self.smoothness_var = tk.DoubleVar(value=1.0)
         add_slider("Smoothness (0.25 tight → 3 round)", self.smoothness_var, 0.25, 3.0, 0.25, "{:.2f}")
+
+        # --- Appearance (pure presentation -- instant re-render, no regenerate) ---
+        ttk.Label(parent, text="Appearance", font=("", 10, "bold")).grid(
+            row=row, column=0, columnspan=2, sticky="w", pady=(14, 2))
+        row += 1
+
+        color_row = ttk.Frame(parent)
+        color_row.grid(row=row, column=0, columnspan=2, sticky="ew")
+        row += 1
+        self.line_color_var = tk.StringVar(value="#ffffff")
+        self.bg_color_var = tk.StringVar(value="#000000")
+        self.line_color_btn = tk.Button(color_row, text="Line", width=7,
+                                         background=self.line_color_var.get(),
+                                         activebackground=self.line_color_var.get(),
+                                         foreground=self._contrast_text_color(self.line_color_var.get()),
+                                         command=lambda: self._pick_color(self.line_color_var, self.line_color_btn, "Line color"))
+        self.line_color_btn.pack(side="left")
+        self.bg_color_btn = tk.Button(color_row, text="Background", width=10,
+                                       background=self.bg_color_var.get(),
+                                       activebackground=self.bg_color_var.get(),
+                                       foreground=self._contrast_text_color(self.bg_color_var.get()),
+                                       command=lambda: self._pick_color(self.bg_color_var, self.bg_color_btn, "Background color"))
+        self.bg_color_btn.pack(side="left", padx=(6, 0))
+
+        ttk.Label(parent, text="Display stroke (px, after generation)").grid(
+            row=row, column=0, columnspan=2, sticky="w", pady=(10, 0))
+        row += 1
+        self.display_stroke_label = ttk.Label(parent, text="--", width=8)
+        self.display_stroke_label.grid(row=row, column=1, sticky="e")
+        self.display_stroke_var = tk.DoubleVar(value=3.0)
+        self.display_stroke_scale = ttk.Scale(parent, from_=1.0, to=3.0, variable=self.display_stroke_var,
+                                               command=self._on_display_stroke_move, state="disabled")
+        self.display_stroke_scale.grid(row=row, column=0, sticky="ew")
+        self.display_stroke_scale.bind("<ButtonRelease-1>", self._on_display_stroke_release)
+        row += 1
+        ttk.Label(parent, text="Generate once to unlock. Capped so the line\ncan never thicken enough to touch itself.",
+                  foreground="#666").grid(row=row, column=0, columnspan=2, sticky="w", pady=(2, 0))
+        row += 1
 
         # --- Advanced (collapsible) ---
         self.advanced_visible = tk.BooleanVar(value=False)
@@ -135,7 +188,6 @@ class CurveApp(tk.Tk):
         row += 1
 
         adv_row = 0
-        self.size_var = tk.IntVar(value=1200)
         self.gap_var = tk.DoubleVar(value=12.0)
         self.preferred_gap_var = tk.DoubleVar(value=18.0)
         self.edge_var = tk.DoubleVar(value=35.0)
@@ -149,15 +201,12 @@ class CurveApp(tk.Tk):
             ttk.Entry(self.advanced_frame, textvariable=var, width=10).grid(row=adv_row, column=1, sticky="e", pady=2)
             adv_row += 1
 
-        add_entry("Canvas size (px)", self.size_var)
         add_entry("Min ink gap (px)", self.gap_var)
         add_entry("Preferred gap (px)", self.preferred_gap_var)
         add_entry("Edge clearance (px)", self.edge_var)
         add_entry("Relax iterations", self.iterations_var)
         add_entry("Edge wave (px)", self.edge_wave_var)
         add_entry("Search attempts", self.attempts_var)
-        ttk.Label(self.advanced_frame, text="1200px takes ~30-60s. Try 500-600\nwhile experimenting.",
-                  foreground="#666").grid(row=adv_row, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
         # --- Animation ---
         self.animate_var = tk.BooleanVar(value=True)
@@ -263,8 +312,10 @@ class CurveApp(tk.Tk):
         try:
             p, report = generate(progress_callback=on_progress, **params)
             self.worker_queue.put(("progress", "render", 92))
-            img = render_png(p, params["size"], params["stroke"])
-            svg_text = render_svg(p, params["size"], params["stroke"])
+            line_color = self.line_color_var.get()
+            bg_color = self.bg_color_var.get()
+            img = render_png(p, params["size"], params["stroke"], line_color=line_color, bg_color=bg_color)
+            svg_text = render_svg(p, params["size"], params["stroke"], line_color=line_color, bg_color=bg_color)
             elapsed = time.time() - t0
             self.worker_queue.put(("done", p, report, img, svg_text, params, elapsed))
         except GenerationError as e:
@@ -286,6 +337,9 @@ class CurveApp(tk.Tk):
                     self._on_generation_done(p, report, img, svg_text, params, elapsed)
                 elif kind == "error":
                     self._on_generation_error(msg[1])
+                elif kind == "rerendered":
+                    _, img, svg_text = msg
+                    self._on_rerendered(img, svg_text)
         except queue.Empty:
             pass
         self.after(100, self._poll_queue)
@@ -301,6 +355,16 @@ class CurveApp(tk.Tk):
         self.last_report = report
         self.last_size = params["size"]
         self.last_stroke = params["stroke"]
+        self.last_generation_stroke = params["stroke"]
+
+        # Unlock "Display stroke": bounded so it can thin freely but can only
+        # thicken up to the point the validated minimum gap would hit zero.
+        gen_stroke = params["stroke"]
+        max_stroke = max_safe_render_stroke(report, gen_stroke)
+        min_stroke = max(0.5, gen_stroke * 0.2)
+        self.display_stroke_scale.config(from_=min_stroke, to=max_stroke, state="normal")
+        self.display_stroke_var.set(gen_stroke)
+        self.display_stroke_label.config(text=f"{gen_stroke:.1f}")
 
         # Overwrite the single preview file set -- never a naming conflict.
         png_path = OUTPUT_DIR / f"{PREVIEW_BASENAME}.png"
@@ -327,6 +391,7 @@ class CurveApp(tk.Tk):
         watching it get drawn. Purely playback -- the path/image were already
         fully computed and validated before this runs."""
         token = self._gen_token
+        self.preview_canvas.config(background=self.bg_color_var.get())
         self.preview_canvas.delete("all")
         scale = PREVIEW_DISPLAY_SIZE / size
         coords = (p * scale).flatten().tolist()  # x0,y0,x1,y1,...
@@ -336,7 +401,7 @@ class CurveApp(tk.Tk):
             return
 
         line_id = self.preview_canvas.create_line(
-            *coords[:4], fill="#ffffff", width=max(1.0, stroke * scale),
+            *coords[:4], fill=self.line_color_var.get(), width=max(1.0, stroke * scale),
             capstyle=tk.ROUND, joinstyle=tk.ROUND)
 
         duration_ms = max(200, self.anim_duration_var.get() * 1000)
@@ -377,9 +442,78 @@ class CurveApp(tk.Tk):
         scale = min(PREVIEW_DISPLAY_SIZE / w, PREVIEW_DISPLAY_SIZE / h, 1.0)
         disp = img.resize((max(1, int(w * scale)), max(1, int(h * scale))))
         self.preview_photo = ImageTk.PhotoImage(disp)
+        self.preview_canvas.config(background=self.bg_color_var.get())
         self.preview_canvas.delete("all")
         self.preview_canvas.create_image(PREVIEW_DISPLAY_SIZE / 2, PREVIEW_DISPLAY_SIZE / 2,
                                           anchor="center", image=self.preview_photo)
+
+    # ------------------------------------------------- appearance / re-render ----
+
+    @staticmethod
+    def _contrast_text_color(hex_color):
+        """Black or white text, whichever reads better against hex_color."""
+        h = hex_color.lstrip("#")
+        try:
+            r, g, b = (int(h[i:i + 2], 16) for i in (0, 2, 4))
+        except (ValueError, IndexError):
+            return "#000000"
+        luminance = 0.299 * r + 0.587 * g + 0.114 * b
+        return "#000000" if luminance > 140 else "#ffffff"
+
+    def _pick_color(self, var, swatch_btn, title):
+        _rgb, hexval = colorchooser.askcolor(color=var.get(), title=title)
+        if not hexval:
+            return  # user cancelled
+        var.set(hexval)
+        swatch_btn.config(background=hexval, activebackground=hexval,
+                           foreground=self._contrast_text_color(hexval))
+        self._maybe_rerender()
+
+    def _on_display_stroke_move(self, _val):
+        self.display_stroke_label.config(text=f"{self.display_stroke_var.get():.1f}")
+
+    def _on_display_stroke_release(self, _evt):
+        self._maybe_rerender()
+
+    def _maybe_rerender(self):
+        """Redraw the already-computed path with the current color/stroke
+        choices. Pure presentation: does not touch the underlying geometry,
+        so this is a fast re-render, not a regenerate, and is safe to fire
+        from a color pick or a stroke-slider release even while nothing new
+        is being generated."""
+        if self.last_path is None or self.busy or self._rerendering:
+            return
+        self._rerendering = True
+        p = self.last_path
+        size = self.last_size
+        stroke = self.display_stroke_var.get()
+        line_color = self.line_color_var.get()
+        bg_color = self.bg_color_var.get()
+
+        def work():
+            img = render_png(p, size, stroke, line_color=line_color, bg_color=bg_color)
+            svg_text = render_svg(p, size, stroke, line_color=line_color, bg_color=bg_color)
+            self.worker_queue.put(("rerendered", img, svg_text))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_rerendered(self, img, svg_text):
+        self._rerendering = False
+        self.last_stroke = self.display_stroke_var.get()
+
+        png_path = OUTPUT_DIR / f"{PREVIEW_BASENAME}.png"
+        svg_path = OUTPUT_DIR / f"{PREVIEW_BASENAME}.svg"
+        img.save(png_path)
+        svg_path.write_text(svg_text)
+
+        self._show_preview(img)
+        gen_stroke = self.last_generation_stroke
+        disp_stroke = self.last_stroke
+        note = "" if abs(disp_stroke - gen_stroke) < 0.05 else f"  (generated at {gen_stroke:.1f}px)"
+        self.info_var.set(
+            f"seed={self.last_report['seed']}  display stroke={disp_stroke:.1f}px{note}  "
+            f"saved to outputs/{PREVIEW_BASENAME}.png"
+        )
 
     # ------------------------------------------------------------ saving ----
 

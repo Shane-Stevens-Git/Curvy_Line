@@ -307,24 +307,44 @@ def generate(size=1200, gap=12.0, preferred_gap=18.0, iterations=50, smoothness=
     return p, report
 
 
-def render_png(p, size, stroke, scale=4):
-    """Return a PIL Image for the path. Pure function: no file I/O."""
-    img = Image.new('RGB', (size*scale, size*scale), '#000000')
+def render_png(p, size, stroke, scale=4, line_color='#ffffff', bg_color='#000000'):
+    """Return a PIL Image for the path. Pure function: no file I/O.
+
+    line_color/bg_color and stroke are pure presentation -- changing them
+    does not affect the validated geometry, so a caller can re-render as
+    many times as it likes without recomputing the path. See
+    max_safe_render_stroke() for the ceiling on how thick stroke can safely
+    go before the line would visually touch itself.
+    """
+    img = Image.new('RGB', (size*scale, size*scale), bg_color)
     draw = ImageDraw.Draw(img)
-    draw.line([tuple(q*scale) for q in p], fill='#ffffff', width=round(stroke*scale), joint='curve')
+    draw.line([tuple(q*scale) for q in p], fill=line_color, width=round(stroke*scale), joint='curve')
     for x, y in p[[0, -1]] * scale:
         r = stroke * scale / 2
-        draw.ellipse((x-r, y-r, x+r, y+r), fill='#ffffff')
+        draw.ellipse((x-r, y-r, x+r, y+r), fill=line_color)
     return img.resize((size, size), Image.Resampling.LANCZOS)
 
 
-def render_svg(p, size, stroke):
+def render_svg(p, size, stroke, line_color='#111111', bg_color='#faf9f5'):
     """Return SVG markup for the path as a string. Pure function: no file I/O."""
     d = 'M ' + ' L '.join(f'{x:.4f},{y:.4f}' for x, y in p)
     return (f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {size} {size}">'
-            f'<rect width="100%" height="100%" fill="#faf9f5"/>'
-            f'<path d="{d}" fill="none" stroke="#111111" stroke-width="{stroke}" '
+            f'<rect width="100%" height="100%" fill="{bg_color}"/>'
+            f'<path d="{d}" fill="none" stroke="{line_color}" stroke-width="{stroke}" '
             f'stroke-linecap="round" stroke-linejoin="round"/></svg>')
+
+
+def max_safe_render_stroke(report, generation_stroke, margin=0.5):
+    """The largest stroke width render_png/render_svg can use for this
+    already-generated path without the line visually touching itself.
+
+    The path was validated at generation time with a specific stroke, giving
+    a guaranteed minimum edge-to-edge ink gap (report['minimum_nonlocal_ink_gap_px']).
+    That gap shrinks by exactly (new_stroke - generation_stroke) as stroke is
+    thickened after the fact, since the centerline spacing itself never
+    changes. margin keeps a small safety buffer above the hard zero-gap point.
+    """
+    return max(generation_stroke, generation_stroke + report['minimum_nonlocal_ink_gap_px'] - margin)
 
 
 def main():
