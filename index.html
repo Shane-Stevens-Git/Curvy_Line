@@ -272,13 +272,15 @@
       <span class="badge">Python 3.10+</span>
       <span class="badge">Desktop app (Tkinter)</span>
       <span class="badge">Windows / macOS / Linux</span>
+      <span class="badge">Live wallpaper (Windows)</span>
     </div>
     <h1>Flowing Curve Generator</h1>
     <p class="tagline">
       Draws a single, continuous, non-intersecting organic line that fills a shape
       edge to edge &mdash; like one long strand of string laid down by hand.
       Pick a shape (or draw your own), tune how it flows, and export it as a
-      PNG or SVG.
+      PNG or SVG &mdash; or set the looping, color-blended "chasing lights"
+      version as an animated live wallpaper on Windows.
     </p>
     <img class="hero-shot" src="screenshots/gui-full-app.png" alt="Flowing Curve Generator desktop app, showing a completed curve fill next to the control sidebar">
   </div>
@@ -382,7 +384,9 @@
       <div class="feature">
         <h4>Color crawl</h4>
         <p>A looping "chasing lights" animation: 3 customizable colors chase down the
-        already-drawn curve, with adjustable crawler size, gap, and speed.</p>
+        already-drawn curve, with adjustable crawler size, gap, and speed &mdash; plus
+        a blend control that fades each color smoothly into the next instead of
+        cutting sharply between them.</p>
       </div>
       <div class="feature">
         <h4>Live appearance controls</h4>
@@ -393,6 +397,12 @@
         <h4>Export</h4>
         <p>Save any result as PNG or SVG (with a validation report alongside it) for
         printing, plotting, or use as a desktop/phone wallpaper.</p>
+      </div>
+      <div class="feature">
+        <h4>Live wallpaper (Windows)</h4>
+        <p>Runs the color-crawl animation as an actual desktop wallpaper in the
+        background, rotating through a set of presets you configure &mdash; one new
+        look per day.</p>
       </div>
     </div>
   </section>
@@ -510,8 +520,10 @@ python gui.py</code></pre>
       <div class="usage-block">
         <dt>Color crawl</dt>
         <dd>A looping "chasing lights" animation along the finished curve. Pick 3
-        colors, and adjust crawler size, the gap between crawlers, and crawl speed
-        &mdash; all update live while it's running. <strong>Start/Stop crawl</strong> toggles it.</dd>
+        colors, and adjust crawler size, the gap between crawlers, crawl speed, and
+        <strong>Blend</strong> (how many shades to fade through between colors, instead
+        of cutting sharply from one to the next) &mdash; all update live while it's
+        running. <strong>Start/Stop crawl</strong> toggles it.</dd>
       </div>
       <div class="usage-block">
         <dt>Save As...</dt>
@@ -524,6 +536,63 @@ python gui.py</code></pre>
         you've saved there before &mdash; the current on-screen preview is kept.</dd>
       </div>
     </dl>
+  </section>
+
+  <section id="wallpaper">
+    <h2>Live wallpaper (Windows)</h2>
+    <p class="lead">
+      <code>wallpaper_engine.py</code> runs the color-crawl animation as an actual
+      desktop wallpaper, in the background, independently of the main app &mdash; close
+      the window (or the app itself) and it keeps going. It shares its animation and
+      color-blend logic with the GUI's own preview, so what you see in
+      <strong>Configure Wallpaper...</strong> is exactly what ends up on your desktop.
+    </p>
+
+    <div class="two-col">
+      <div>
+        <img src="screenshots/gui-live-wallpaper-section.png" alt="The Color crawl and Live wallpaper controls in the main app sidebar, including the new Blend slider" style="border: 1px solid var(--border);">
+      </div>
+      <div>
+        <img src="screenshots/wallpaper-dialog.png" alt="The Configure Wallpaper dialog, showing daily preset rotation, per-preset colors and blend, display settings, monitor choice, and the experimental rendering toggle" style="border: 1px solid var(--border);">
+      </div>
+    </div>
+
+    <h3>What it does</h3>
+    <ul class="list">
+      <li><strong>Daily rotation</strong> &mdash; a list of presets (add/remove/reorder
+      as many "days" as you like), one shown per calendar day, wrapping back to the top.</li>
+      <li><strong>Per-preset editor</strong> &mdash; fill shape, 3 crawler colors,
+      crawler size, gap, speed, and <strong>Blend</strong> (steps between colors), all
+      independent per preset. <strong>Copy from current Color crawl settings</strong>
+      grabs whatever's dialed in on the main preview so you can turn a look you like
+      into a wallpaper day in one click.</li>
+      <li><strong>Display settings</strong> &mdash; background color, stroke width, and
+      edge inset, shared across every preset.</li>
+      <li><strong>Monitors</strong> &mdash; run on just the monitor the app is on, or
+      stretch the same pattern across all of them.</li>
+      <li><strong>Start Wallpaper Now / Stop Wallpaper</strong> &mdash; saves your
+      changes and launches (or stops) <code>wallpaper_engine.py</code> as its own
+      background process, so it survives closing the dialog, the app, or your sign-in
+      session.</li>
+    </ul>
+
+    <div class="callout" style="border-left-color: var(--accent-3); background: rgba(255, 89, 94, 0.08);">
+      <strong>Known issue &mdash; "Render behind desktop icons":</strong> Windows has a
+      well-known trick for placing a window behind your desktop icons (instead of on
+      top of them), and this app can attempt it. On testing, though, it turned out to
+      freeze all mouse clicks on whichever monitor the wallpaper's window was on
+      &mdash; including the taskbar and unrelated apps &mdash; until that window was
+      minimized. The root cause traces back to that specific Windows trick itself
+      (reparenting the window under a different process's window), not to anything
+      else that was tried and ruled out along the way (DPI handling, z-order, focus).
+      Because of that, it's an opt-in, off-by-default checkbox
+      (<strong>Render behind desktop icons (experimental)</strong>) rather than the
+      default behavior: left off (the default), the wallpaper sits on top of your
+      icons instead of behind them &mdash; they're visually covered while it runs, but
+      clicks still reach them. I plan to dig back into <em>why</em> that reparenting
+      trick breaks input on some setups and see if it can be made safe, but for now
+      the safe, click-friendly default is what ships.
+    </div>
   </section>
 
   <section id="notes">
@@ -545,10 +614,12 @@ python gui.py</code></pre>
       <tr><th>File</th><th>What it is</th></tr>
       <tr><td><code>organic_curve.py</code></td><td>The generation algorithm and PNG/SVG rendering &mdash; usable standalone from the command line, or imported by the GUI.</td></tr>
       <tr><td><code>gui.py</code></td><td>The desktop app (this is what <code>run.bat</code> / <code>run.sh</code> launch).</td></tr>
+      <tr><td><code>wallpaper_engine.py</code></td><td>The background live-wallpaper process, launched by <strong>Start Wallpaper Now</strong> in <code>gui.py</code>'s <strong>Configure Wallpaper...</strong> dialog &mdash; Windows only.</td></tr>
       <tr><td><code>requirements.txt</code></td><td>Python dependencies (numpy, scipy, shapely, Pillow).</td></tr>
       <tr><td><code>run.bat</code> / <code>run.sh</code></td><td>One-click setup + launch, for Windows and macOS/Linux respectively &mdash; already in every clone.</td></tr>
       <tr><td><code>install.bat</code> / <code>install.sh</code></td><td>The standalone installer linked at the top of this page &mdash; downloads the whole project fresh, then hands off to <code>run.bat</code> / <code>run.sh</code> above.</td></tr>
       <tr><td><code>outputs/</code></td><td>Where the app writes the current preview and anything saved with "Save As...".</td></tr>
+      <tr><td><code>wallpaper_config.json</code></td><td>Your saved wallpaper presets and settings &mdash; created on first use of <strong>Configure Wallpaper...</strong>, not part of the source.</td></tr>
     </table>
   </section>
 
