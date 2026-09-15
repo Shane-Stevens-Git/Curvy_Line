@@ -432,6 +432,62 @@ def _virtual_screen_bounds(fallback_root=None, monitor_mode="primary"):
     return 0, 0, w, h
 
 
+def _make_input_safe(hwnd):
+    """Apply the standard Win32 recipe for "a window that's purely a
+    visual background layer: it never takes keyboard/mouse focus, and
+    mouse input passes straight through it to whatever's underneath" --
+    WS_EX_NOACTIVATE (never becomes the active/foreground window, whether
+    from being created, clicked, or Alt-Tabbed to) plus WS_EX_TRANSPARENT
+    (excluded from mouse hit-testing entirely, so clicks land on whatever
+    is actually beneath it) plus WS_EX_LAYERED (required for
+    WS_EX_TRANSPARENT to take full effect, and for SetLayeredWindowAttributes
+    below to apply).
+
+    Why this exists: wallpaper_debug.log confirmed the WorkerW reparenting
+    itself was working correctly (right monitor, right position, low CPU)
+    -- yet clicks kept failing across the *entire* monitor, including the
+    taskbar and unrelated apps, and the fix turned out to be: minimize
+    gui.py. That points at a focus/activation conflict between gui.py's
+    window (open and active on that monitor) and this new top-level
+    window being created on top of/alongside it -- not at anything to do
+    with WorkerW, z-order, or CPU load. WS_EX_NOACTIVATE stops this window
+    from ever contesting activation with gui.py in the first place; called
+    while still withdrawn (see WallpaperWindow.__init__), before this
+    window is ever shown, so there's no window of time where it could
+    grab focus before the style takes effect.
+
+    Best-effort: failure here should never crash the wallpaper, since a
+    visible-but-occasionally-input-grabby window still beats no wallpaper
+    at all."""
+    if sys.platform != "win32":
+        return
+    try:
+        GWL_EXSTYLE = -20
+        WS_EX_LAYERED = 0x00080000
+        WS_EX_TRANSPARENT = 0x00000020
+        WS_EX_NOACTIVATE = 0x08000000
+        LWA_ALPHA = 0x2
+
+        user32 = ctypes.windll.user32
+        user32.GetWindowLongW.restype = ctypes.c_long
+        user32.GetWindowLongW.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        user32.SetWindowLongW.restype = ctypes.c_long
+        user32.SetWindowLongW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_long]
+
+        ex_style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+        new_style = ex_style | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE
+        user32.SetWindowLongW(hwnd, GWL_EXSTYLE, new_style)
+        # WS_EX_LAYERED windows need an explicit layering call to actually
+        # composite (fully opaque here -- this isn't about transparency of
+        # the *pixels*, only of *input*), or some Windows versions render
+        # them blank.
+        user32.SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA)
+        _debug_log(f"input-safe: hwnd={hwnd}, old ex_style={ex_style:#x}, new ex_style={new_style:#x} "
+                   f"(added WS_EX_LAYERED|WS_EX_TRANSPARENT|WS_EX_NOACTIVATE)")
+    except Exception as exc:  # noqa: BLE001 -- best-effort safety net only
+        _debug_log(f"input-safe: FAILED: {exc!r}")
+
+
 def _rect_overlap_area(a, b):
     """Intersection area of two (left, top, right, bottom) rects, or 0 if
     they don't overlap (or either is missing/degenerate)."""
@@ -678,6 +734,13 @@ class WallpaperWindow:
         self.preset = current_preset(self.cfg)
 
         self.root = tk.Tk()
+        # Hide immediately, before this window is ever mapped to the screen
+        # -- everything below (geometry, extended input-safety styles,
+        # reparenting) happens while it's still invisible, so there's no
+        # window of time where a not-yet-configured top-level window could
+        # flash up and contest focus/activation with gui.py. Shown for
+        # real only at the very end, via deiconify().
+        self.root.withdraw()
         monitor_mode = self.cfg.get("monitor_mode", "primary")
         if monitor_mode not in ("primary", "all"):
             monitor_mode = "primary"
@@ -715,6 +778,16 @@ class WallpaperWindow:
             root_hwnd = hwnd
         _debug_log(f"root_hwnd={root_hwnd}, canvas_hwnd={hwnd}, "
                    f"root rect before reparent={_get_window_rect(root_hwnd)}")
+
+        # Applied while still withdrawn (invisible): never take
+        # keyboard/mouse focus, and let clicks pass straight through to
+        # whatever's actually underneath. This is what actually fixes the
+        # "GUI's monitor stops accepting clicks until you minimize GUI"
+        # bug -- see _make_input_safe()'s docstring. It's independent of
+        # (and a stronger guarantee than) the WorkerW reparenting below,
+        # so it applies whether or not that succeeds.
+        _make_input_safe(root_hwnd)
+
         target_rect = (self.x, self.y, self.x + self.w, self.y + self.h)
         reparented = reparent_behind_desktop_icons(root_hwnd, target_rect=target_rect)
         if not reparented:
@@ -737,6 +810,11 @@ class WallpaperWindow:
                 pass
         else:
             _debug_log(f"root rect after reparent={_get_window_rect(root_hwnd)}")
+
+        # Finally make it visible -- everything above (geometry, the
+        # input-safety styles, reparenting) is already in place, so there's
+        # no gap where an unconfigured window could grab focus.
+        self.root.deiconify()
 
         self._phase = 0.0
         self._last_tick = time.time()
