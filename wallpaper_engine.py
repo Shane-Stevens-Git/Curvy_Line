@@ -402,6 +402,43 @@ def reparent_behind_desktop_icons(hwnd):
     return True
 
 
+def _make_dpi_aware():
+    """Tell Windows this process handles its own DPI scaling, *before*
+    anything else touches a window or GetSystemMetrics.
+
+    Order matters: if this runs after tk.Tk()/geometry() (as it used to,
+    inside WallpaperWindow.__init__), Windows has already handed out
+    DPI-virtualized (scaled) coordinates for monitor geometry and window
+    placement, based on whatever monitor the process *happened* to be
+    considered "on" at that point. On a mixed-DPI multi-monitor setup this
+    can put the window's real on-screen rectangle somewhere other than
+    where the math intended -- e.g. covering/intercepting input on a
+    different monitor than the one the wallpaper is meant to render on,
+    which looks exactly like "the monitor the GUI is on stops accepting
+    clicks." Calling this first, before any Tk/window/monitor call, makes
+    every subsequent coordinate physical-pixel and monitor-accurate.
+
+    Prefers per-monitor-v2 DPI awareness (correct for mixed-DPI multi-monitor
+    rigs) and falls back to the older system-DPI-only API on Windows
+    versions that don't have it, or to doing nothing at all if both fail --
+    a slightly blurry wallpaper beats a crash."""
+    if sys.platform != "win32":
+        return
+    try:
+        # DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 == -4. Needs an
+        # explicit c_void_p so ctypes doesn't try to pass -4 as a 32-bit
+        # int on 64-bit Windows.
+        ok = ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
+        if ok:
+            return
+    except (AttributeError, OSError):
+        pass  # older Windows without per-monitor-v2 support
+    try:
+        ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
+
+
 # --- Tkinter rendering ---------------------------------------------------
 
 class WallpaperWindow:
@@ -441,12 +478,6 @@ class WallpaperWindow:
             self.root.attributes("-topmost", False)
         except tk.TclError:
             pass
-
-        if sys.platform == "win32":
-            try:
-                ctypes.windll.user32.SetProcessDPIAware()
-            except Exception:
-                pass  # best-effort; a slightly blurry wallpaper beats a crash
 
         self.canvas = tk.Canvas(self.root, width=self.w, height=self.h,
                                  highlightthickness=0, bd=0,
@@ -562,6 +593,12 @@ class WallpaperWindow:
 
 
 def main():
+    # Must be the very first Windows API call in the process -- before any
+    # Tk window is created or any monitor geometry is read -- so every
+    # coordinate downstream of this is physical-pixel and monitor-accurate.
+    # See _make_dpi_aware()'s docstring for why this used to be a bug.
+    _make_dpi_aware()
+
     test_seconds = None
     for i, arg in enumerate(sys.argv):
         if arg == "--test-seconds" and i + 1 < len(sys.argv):
