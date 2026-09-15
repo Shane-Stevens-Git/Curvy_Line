@@ -432,11 +432,50 @@ def _virtual_screen_bounds(fallback_root=None, monitor_mode="primary"):
     return 0, 0, w, h
 
 
-def reparent_behind_desktop_icons(hwnd):
+def _rect_overlap_area(a, b):
+    """Intersection area of two (left, top, right, bottom) rects, or 0 if
+    they don't overlap (or either is missing/degenerate)."""
+    if not a or not b:
+        return 0
+    left = max(a[0], b[0])
+    top = max(a[1], b[1])
+    right = min(a[2], b[2])
+    bottom = min(a[3], b[3])
+    if right <= left or bottom <= top:
+        return 0
+    return (right - left) * (bottom - top)
+
+
+def reparent_behind_desktop_icons(hwnd, target_rect=None):
     """The WorkerW trick: ask Progman to spawn a WorkerW window behind the
     desktop icons (undocumented but stable since Windows 7/8, used by every
     "live wallpaper" tool that doesn't ship its own desktop replacement),
     find that specific WorkerW, and SetParent() our window into it.
+
+    On a multi-monitor machine, Explorer can maintain *more than one*
+    SHELLDLL_DefView-hosting top-level window, each with its own adjacent
+    WorkerW scoped to a single monitor's rectangle rather than the whole
+    virtual desktop -- confirmed via wallpaper_debug.log on a real 2-monitor
+    machine (Progman -> Explorer's EnumWindows order surfaced 17 top-level
+    "WorkerW"-classed windows total, most of them unrelated tiny helper
+    windows that just happen to share the class name, and exactly one real
+    desktop-icon WorkerW pair, scoped to the *other* monitor from the one
+    requested). Blindly taking "whichever SHELLDLL_DefView-adjacent WorkerW
+    EnumWindows happens to report last" -- the previous approach -- means
+    on such a machine you can silently attach to the wrong monitor's
+    WorkerW. SetParent() doesn't adjust the child's screen position for the
+    new parent's origin, so the window then visibly *jumps* to wherever
+    that WorkerW's monitor is, which is exactly what the log showed: a
+    window created at (0,0,1920,1080) landed at (-1920,0,0,1080) after
+    SetParent -- a clean one-monitor-width shift.
+
+    target_rect, when given as (left, top, right, bottom) in screen
+    coordinates, lets the caller say which monitor it actually wants: every
+    SHELLDLL_DefView-adjacent WorkerW found is scored by how much it
+    overlaps target_rect, and the best-overlapping one wins (falling back
+    to "last one found" only if none overlap at all, so this still works
+    if Explorer's WorkerW for the target monitor can't be found for some
+    reason, or when target_rect isn't given).
 
     IMPORTANT: every one of these functions must have .restype/.argtypes
     explicitly set to wintypes.HWND. ctypes defaults an unannotated
@@ -472,60 +511,143 @@ def reparent_behind_desktop_icons(hwnd):
     if not progman:
         return False
 
-    # Ask Progman to spawn a WorkerW behind the icons. The response value
-    # doesn't matter -- what matters is the side effect of a new WorkerW
-    # appearing, which we then have to go find via EnumWindows below.
-    result = ctypes.c_void_p(0)
-    user32.SendMessageTimeoutW(progman, 0x052C, 0, 0, 0x0, 1000, ctypes.byref(result))
+    def _find_target_workerw():
+        """One EnumWindows pass to find every WorkerW that sits directly
+        behind a desktop-icons layer (i.e. is the top-level sibling of some
+        top-level window that hosts SHELLDLL_DefView -- there can be more
+        than one such pair on a multi-monitor machine), plus a diagnostic
+        list of every top-level WorkerW-classed window seen at all
+        (including unrelated ones that just share the class name)."""
+        candidates = []  # every SHELLDLL_DefView-adjacent WorkerW: (hwnd, rect)
+        seen = []  # diagnostic only: every top-level WorkerW hwnd + its screen rect
 
-    target_workerw = [None]
-    all_workerw_seen = []  # diagnostic only: every top-level WorkerW hwnd + its screen rect
+        @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        def _enum_windows_cb(hwnd_top, _lparam):
+            shell_view = user32.FindWindowExW(hwnd_top, None, "SHELLDLL_DefView", None)
+            if shell_view:
+                candidate = user32.FindWindowExW(None, hwnd_top, "WorkerW", None)
+                if candidate:
+                    candidates.append((candidate, _get_window_rect(candidate)))
+            return True
 
-    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
-    def _enum_windows_cb(hwnd_top, _lparam):
-        shell_view = user32.FindWindowExW(hwnd_top, None, "SHELLDLL_DefView", None)
-        if shell_view:
-            # The WorkerW we want is the *next sibling* of the top-level
-            # window that hosts SHELLDLL_DefView (the icon layer), not that
-            # window itself.
-            candidate = user32.FindWindowExW(None, hwnd_top, "WorkerW", None)
-            if candidate:
-                target_workerw[0] = candidate
-        return True
+        @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        def _enum_all_workerw_cb(hwnd_top, _lparam):
+            buf = ctypes.create_unicode_buffer(256)
+            user32.GetClassNameW(hwnd_top, buf, 256)
+            if buf.value == "WorkerW":
+                seen.append((hwnd_top, _get_window_rect(hwnd_top)))
+            return True
 
-    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
-    def _enum_all_workerw_cb(hwnd_top, _lparam):
-        # Diagnostic pass only: log every top-level window of class
-        # "WorkerW" and where it sits on screen, so a debug log can show
-        # whether more than one exists and which one we actually picked.
-        buf = ctypes.create_unicode_buffer(256)
-        ctypes.windll.user32.GetClassNameW(hwnd_top, buf, 256)
-        if buf.value == "WorkerW":
-            all_workerw_seen.append((hwnd_top, _get_window_rect(hwnd_top)))
-        return True
+        user32.EnumWindows(_enum_windows_cb, 0)
+        user32.EnumWindows(_enum_all_workerw_cb, 0)
+        return candidates, seen
 
-    user32.EnumWindows(_enum_windows_cb, 0)
-    user32.EnumWindows(_enum_all_workerw_cb, 0)
+    def _pick_best(candidates):
+        """Prefer whichever candidate's rect overlaps target_rect the most
+        (the monitor we actually want to render on); if target_rect wasn't
+        given, or nothing overlaps it, fall back to the last candidate
+        found (the previous behavior) so this still degrades gracefully."""
+        if not candidates:
+            return None, False
+        if target_rect is not None:
+            scored = [(cand, _rect_overlap_area(rect, target_rect)) for cand, rect in candidates]
+            best_cand, best_score = max(scored, key=lambda pair: pair[1])
+            if best_score > 0:
+                return best_cand, True
+        # Either target_rect wasn't given, or nothing overlaps it at all --
+        # fall back to the last one found (the previous behavior), but
+        # flag it as an unconfirmed match so the caller can decide whether
+        # it's safe to attach to (see matched_target_monitor below).
+        return candidates[-1][0], False
 
-    _debug_log(f"reparent: all top-level WorkerW windows seen: {all_workerw_seen}")
-    _debug_log(f"reparent: chosen target_workerw={target_workerw[0]}, "
-               f"rect={_get_window_rect(target_workerw[0]) if target_workerw[0] else None}")
+    # Check for an already-existing target WorkerW *before* asking Progman
+    # to spawn a new one. The 0x052C message is not documented to be
+    # idempotent, and several other WorkerW-trick implementations report
+    # that sending it again in a session that already has one (e.g. a
+    # second Start after a Stop, in the same Explorer session) can create
+    # an *additional* WorkerW rather than reusing the existing one.
+    # Reusing whatever's already there when possible avoids ever piling
+    # these up.
+    candidates, all_workerw_seen = _find_target_workerw()
+    if candidates:
+        _debug_log(f"reparent: found {len(candidates)} existing SHELLDLL_DefView-adjacent "
+                   f"WorkerW candidate(s) without spawning a new one: {candidates} "
+                   f"(all WorkerW seen: {all_workerw_seen})")
+    else:
+        # Ask Progman to spawn a WorkerW behind the icons. The response
+        # value doesn't matter -- what matters is the side effect of a new
+        # WorkerW appearing, which we then have to go find via EnumWindows.
+        result = ctypes.c_void_p(0)
+        user32.SendMessageTimeoutW(progman, 0x052C, 0, 0, 0x0, 1000, ctypes.byref(result))
+        candidates, all_workerw_seen = _find_target_workerw()
+        _debug_log(f"reparent: no existing candidates, sent spawn message, "
+                   f"now see {len(candidates)} candidate(s): {candidates}")
 
-    if not target_workerw[0]:
+    target_workerw, matched_target_monitor = _pick_best(candidates)
+    _debug_log(f"reparent: target_rect={target_rect}, candidates={candidates}, "
+               f"chosen target_workerw={target_workerw}, matched_target_monitor={matched_target_monitor}")
+
+    if not target_workerw:
+        return False
+
+    if target_rect is not None and not matched_target_monitor:
+        # We were asked to render on a specific monitor rectangle, but no
+        # SHELLDLL_DefView-adjacent WorkerW we could find overlaps it at
+        # all -- every real candidate is scoped to some other monitor.
+        # Attaching anyway would mean either (a) leaving the window at its
+        # old screen position, now silently reinterpreted relative to a
+        # parent whose client area doesn't cover it (likely clipped to
+        # invisible, and definitely on the wrong monitor if it renders at
+        # all), or (b) explicitly repositioning it outside that parent's
+        # own bounds, which risks the same clipping. Neither is better
+        # than the normal-window fallback the caller already has for
+        # exactly this situation, so refuse cleanly here instead of
+        # guessing which risk to take.
+        _debug_log(f"reparent: no candidate WorkerW overlaps target_rect={target_rect} -- "
+                   f"refusing to attach to an unrelated monitor's WorkerW; falling back "
+                   f"to a normal window instead.")
         return False
 
     rect_before = _get_window_rect(hwnd)
     kernel32.SetLastError(0)
-    prev_parent = user32.SetParent(hwnd, target_workerw[0])
+    prev_parent = user32.SetParent(hwnd, target_workerw)
     if not prev_parent:
         err = kernel32.GetLastError()
         _debug_log(f"reparent: SetParent FAILED, GetLastError={err}, "
-                   f"hwnd={hwnd}, target={target_workerw[0]}, rect_before={rect_before}")
+                   f"hwnd={hwnd}, target={target_workerw}, rect_before={rect_before}")
         return False
 
     rect_after = _get_window_rect(hwnd)
     _debug_log(f"reparent: SetParent OK, prev_parent={prev_parent}, "
                f"rect_before={rect_before}, rect_after={rect_after}")
+
+    # SetParent() does not adjust the child's position for the new parent's
+    # screen origin -- it reinterprets the *same* x/y as parent-relative
+    # instead of screen-relative, which is exactly what produced the
+    # one-monitor-width jump seen in testing. Explicitly re-anchor to the
+    # intended absolute screen rectangle now that we know the chosen
+    # parent's own on-screen position, so the final result is correct even
+    # if the parent we attached to isn't pixel-for-pixel where target_rect
+    # says it should be.
+    if target_rect is not None:
+        parent_rect = _get_window_rect(target_workerw)
+        if parent_rect:
+            user32.SetWindowPos.restype = wintypes.BOOL
+            user32.SetWindowPos.argtypes = [
+                wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
+                ctypes.c_int, ctypes.c_int, wintypes.UINT,
+            ]
+            rel_x = target_rect[0] - parent_rect[0]
+            rel_y = target_rect[1] - parent_rect[1]
+            want_w = target_rect[2] - target_rect[0]
+            want_h = target_rect[3] - target_rect[1]
+            SWP_NOZORDER = 0x0004
+            SWP_NOACTIVATE = 0x0010
+            ok = user32.SetWindowPos(hwnd, None, rel_x, rel_y, want_w, want_h,
+                                      SWP_NOZORDER | SWP_NOACTIVATE)
+            _debug_log(f"reparent: SetWindowPos(rel_x={rel_x}, rel_y={rel_y}, "
+                       f"w={want_w}, h={want_h}) -> ok={ok}, "
+                       f"rect_after_reposition={_get_window_rect(hwnd)}")
     return True
 
 
@@ -593,7 +715,8 @@ class WallpaperWindow:
             root_hwnd = hwnd
         _debug_log(f"root_hwnd={root_hwnd}, canvas_hwnd={hwnd}, "
                    f"root rect before reparent={_get_window_rect(root_hwnd)}")
-        reparented = reparent_behind_desktop_icons(root_hwnd)
+        target_rect = (self.x, self.y, self.x + self.w, self.y + self.h)
+        reparented = reparent_behind_desktop_icons(root_hwnd, target_rect=target_rect)
         if not reparented:
             print("Could not attach behind the desktop icons "
                   "(WorkerW trick did not find its target) -- "
