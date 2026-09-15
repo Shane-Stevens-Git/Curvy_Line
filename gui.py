@@ -337,9 +337,18 @@ class CurveApp(tk.Tk):
         self.anim_duration_var = tk.DoubleVar(value=2.5)
         add_slider("Draw duration (s)", self.anim_duration_var, 0.5, 15.0, 0.5, "{:.1f}")
 
+        # Replay lives here (rather than down with the rest of the
+        # after-generate controls) so it sits right next to the animation
+        # settings it replays with -- it's disabled until a generation
+        # exists, same as before.
+        self.replay_btn = ttk.Button(parent, text="Replay animation", command=self._replay_animation,
+                                      state="disabled")
+        self.replay_btn.grid(row=row, column=0, columnspan=2, sticky="ew", pady=(16, 4))
+        row += 1
+
         # --- Generate button + progress ---
         self.generate_btn = ttk.Button(parent, text="Generate", command=self._start_generate)
-        self.generate_btn.grid(row=row, column=0, columnspan=2, sticky="ew", pady=(16, 4))
+        self.generate_btn.grid(row=row, column=0, columnspan=2, sticky="ew", pady=(4, 4))
         row += 1
 
         self.progress = ttk.Progressbar(parent, mode="determinate", maximum=100)
@@ -430,11 +439,7 @@ class CurveApp(tk.Tk):
                   foreground="#666").grid(row=row, column=0, columnspan=2, sticky="w", pady=(0, 4))
         row += 1
 
-        # --- Replay / Save / cleanup ---
-        self.replay_btn = ttk.Button(parent, text="Replay animation", command=self._replay_animation,
-                                      state="disabled")
-        self.replay_btn.grid(row=row, column=0, columnspan=2, sticky="ew", pady=(8, 4))
-        row += 1
+        # --- Save / cleanup ---
         self.save_btn = ttk.Button(parent, text="Save As...", command=self._save_as, state="disabled")
         self.save_btn.grid(row=row, column=0, columnspan=2, sticky="ew", pady=(8, 4))
         row += 1
