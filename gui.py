@@ -1525,7 +1525,17 @@ class CurveApp(tk.Tk):
                 kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
             self._wallpaper_proc = subprocess.Popen(
                 [sys.executable, str(WALLPAPER_ENGINE_PATH)],
-                cwd=str(WALLPAPER_ENGINE_PATH.parent), **kwargs,
+                cwd=str(WALLPAPER_ENGINE_PATH.parent),
+                # Explicitly cut the child off from this process's own
+                # stdin/stdout/stderr rather than leaving them to be
+                # inherited. Combining CREATE_NO_WINDOW (no console for the
+                # child) with inherited console handles is a known way for
+                # the Popen() call itself to hang on Windows -- which would
+                # freeze this whole app, since nothing else runs until it
+                # returns. DEVNULL avoids touching the parent's handles at
+                # all.
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                **kwargs,
             )
         except OSError as e:
             messagebox.showerror("Could not start", str(e), parent=self._wallpaper_dialog)

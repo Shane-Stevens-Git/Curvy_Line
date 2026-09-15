@@ -24,19 +24,23 @@ Not Windows? The WorkerW reparenting step is skipped and you get a normal
 and rotation logic on macOS/Linux even though it isn't a real wallpaper
 there.
 
-Two settings worth knowing about in wallpaper_config.json (no GUI for
-these yet -- see DEFAULT_CONFIG below for every key):
-  - "edge": how far the curve is inset from the screen's border. Small by
-    default so the pattern fills essentially the whole monitor.
-  - "monitor_mode": "primary" (default, just your main monitor) or "all"
-    (stretches one curve across every monitor combined -- looks stretched
-    rather than uniform per screen if your monitors don't match).
+gui.py's "Configure Wallpaper..." dialog edits wallpaper_config.json for
+you (colors, presets, edge, monitor_mode, and so on) and can start/stop
+this script directly -- hand-editing the file is only needed for anything
+that dialog doesn't cover yet.
+
+Refuses to start a second instance (see _acquire_lock): two of these
+running at once would both try to reparent into WorkerW and redraw the
+screen, which can make the whole desktop sluggish -- whether the earlier
+one was started from gui.py, a previous run of this script, or the test
+.bat file.
 
 Run directly with:  python wallpaper_engine.py
 (same .venv / dependencies as gui.py -- see run.bat/run.sh)
 """
 import ctypes
 import json
+import os
 import queue
 import random
 import sys
@@ -53,6 +57,7 @@ from organic_curve import generate, crawl_bands, GenerationError, FILL_SHAPES
 BASE_DIR = Path(__file__).parent
 CONFIG_PATH = BASE_DIR / "wallpaper_config.json"
 CACHE_DIR = BASE_DIR / "wallpaper_cache"
+LOCK_PATH = BASE_DIR / "wallpaper.lock"
 
 # Curves are generated at this resolution (on the long edge) no matter how
 # big the real screen is, then scaled up when drawing -- redrawing tens or
@@ -142,6 +147,56 @@ def load_config():
 
 def save_config(cfg):
     CONFIG_PATH.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+
+
+# --- single-instance lock -----------------------------------------------
+
+def _pid_alive(pid):
+    """True if a process with this PID currently exists. Used to tell a
+    stale lock file (left behind by a crash or a forceful kill, where
+    nothing had the chance to clean it up) from a real still-running
+    instance."""
+    if sys.platform == "win32":
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        handle = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            return False
+        ctypes.windll.kernel32.CloseHandle(handle)
+        return True
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def acquire_lock():
+    """Refuse to start a second instance -- two of these running at once
+    would both try to reparent into WorkerW and redraw the screen, which
+    can make the whole desktop sluggish. Returns True if it's safe to
+    proceed (no other live instance holds the lock), False otherwise.
+    Best-effort: a lock file we can't read/write doesn't block startup,
+    since running unprotected beats not running at all."""
+    if LOCK_PATH.exists():
+        try:
+            other_pid = int(LOCK_PATH.read_text().strip())
+        except (OSError, ValueError):
+            other_pid = None
+        if other_pid is not None and other_pid != os.getpid() and _pid_alive(other_pid):
+            return False
+    try:
+        LOCK_PATH.write_text(str(os.getpid()))
+    except OSError:
+        pass
+    return True
+
+
+def release_lock():
+    try:
+        if LOCK_PATH.exists() and LOCK_PATH.read_text().strip() == str(os.getpid()):
+            LOCK_PATH.unlink()
+    except OSError:
+        pass
 
 
 def current_preset(cfg):
@@ -515,12 +570,20 @@ def main():
             except ValueError:
                 pass
 
+    if not acquire_lock():
+        print("Another wallpaper_engine.py instance already appears to be running "
+              "-- exiting instead of starting a second one on top of it.")
+        return
+
     if sys.platform != "win32":
         print("wallpaper_engine.py's desktop-icon reparenting only works on "
               "Windows. Running anyway in a normal (non-wallpaper) window, "
               "which is fine for testing the animation and rotation logic.")
-    window = WallpaperWindow()
-    window.run(test_seconds=test_seconds)
+    try:
+        window = WallpaperWindow()
+        window.run(test_seconds=test_seconds)
+    finally:
+        release_lock()
 
 
 if __name__ == "__main__":
