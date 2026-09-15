@@ -4,7 +4,7 @@ Captured from a brainstorm on 2026-09-15. Nothing here is built yet — these
 are notes on what each idea would actually take, so we can pick them up
 later without re-deriving the approach.
 
-## 1. Fill other simple shapes (circle, triangle), not just the square
+## 1. Fill other simple shapes (circle, triangle), not just the square (DONE)
 
 The current algorithm scatters points inside the square canvas (minus edge
 margin), connects them with a Euclidean minimum spanning tree, inflates
