@@ -39,15 +39,69 @@ Run directly with:  python wallpaper_engine.py
 (same .venv / dependencies as gui.py -- see run.bat/run.sh)
 """
 import ctypes
+import sys
+
+
+def _make_dpi_aware():
+    """Tell Windows this process handles its own DPI scaling, *before*
+    anything else touches a window or GetSystemMetrics.
+
+    Order matters: if this runs after tk.Tk()/geometry() (as it used to,
+    inside WallpaperWindow.__init__), Windows has already handed out
+    DPI-virtualized (scaled) coordinates for monitor geometry and window
+    placement, based on whatever monitor the process *happened* to be
+    considered "on" at that point. On a mixed-DPI multi-monitor setup this
+    can put the window's real on-screen rectangle somewhere other than
+    where the math intended.
+
+    Called here, at true import time -- before tkinter (or anything else)
+    is even imported, let alone before a Tk() is created -- rather than
+    just "early in main()", on the theory that a runtime DPI-awareness
+    call needs to happen before *anything* Windows might consider
+    DPI-relevant, and importing tkinter is the earliest such thing in this
+    process. (A first attempt moved this to the top of main(), which did
+    not resolve the click-blocking bug this exists to fix -- so this is a
+    belt-and-suspenders tightening of that fix, not a confirmed additional
+    root cause on its own; see wallpaper_debug.log for what's actually
+    happening on a given machine.)
+
+    Prefers per-monitor-v2 DPI awareness (correct for mixed-DPI multi-monitor
+    rigs) and falls back to the older system-DPI-only API on Windows
+    versions that don't have it, or to doing nothing at all if both fail --
+    a slightly blurry wallpaper beats a crash.
+
+    Returns a short string describing what happened (stashed in the
+    DPI_AWARENESS_RESULT global below since this runs before the debug-log
+    helper exists to record it directly) -- purely diagnostic."""
+    if sys.platform != "win32":
+        return "not windows"
+    try:
+        # DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 == -4. Needs an
+        # explicit c_void_p so ctypes doesn't try to pass -4 as a 32-bit
+        # int on 64-bit Windows.
+        ok = ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
+        if ok:
+            return "per-monitor-v2"
+    except (AttributeError, OSError):
+        pass  # older Windows without per-monitor-v2 support
+    try:
+        ok = ctypes.windll.user32.SetProcessDPIAware()
+        return "system-dpi-aware" if ok else "SetProcessDPIAware returned failure"
+    except Exception as exc:  # noqa: BLE001 -- diagnostic only
+        return f"both calls failed: {exc!r}"
+
+
+# Must run before tkinter (or anything else) is imported.
+DPI_AWARENESS_RESULT = _make_dpi_aware()
+
 import json
 import os
 import queue
 import random
-import sys
 import threading
 import time
 import tkinter as tk
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
 import numpy as np
@@ -58,6 +112,49 @@ BASE_DIR = Path(__file__).parent
 CONFIG_PATH = BASE_DIR / "wallpaper_config.json"
 CACHE_DIR = BASE_DIR / "wallpaper_cache"
 LOCK_PATH = BASE_DIR / "wallpaper.lock"
+DEBUG_LOG_PATH = BASE_DIR / "wallpaper_debug.log"
+
+# Set True only while actively chasing the "clicks blocked on the GUI's
+# monitor" bug -- writes timestamped diagnostics (monitor geometry, window
+# handles/rects before and after the WorkerW reparent, whether SetParent
+# actually succeeded) to wallpaper_debug.log next to this file. Cheap
+# (a handful of short writes at startup, none in the animation loop) and
+# gitignored, but there's no reason to leave it on once this is resolved.
+DEBUG_LOGGING = True
+
+_debug_log_started = False
+
+
+def _debug_log(msg):
+    """Best-effort diagnostic logging -- never let a logging failure take
+    down the wallpaper. Truncates at the start of each run (so the file
+    always reflects the most recent run, not an unbounded history) and
+    appends for the rest of that run."""
+    if not DEBUG_LOGGING:
+        return
+    global _debug_log_started
+    try:
+        mode = "a" if _debug_log_started else "w"
+        _debug_log_started = True
+        with open(DEBUG_LOG_PATH, mode, encoding="utf-8") as f:
+            f.write(f"[{datetime.now().isoformat(timespec='milliseconds')}] {msg}\n")
+    except OSError:
+        pass
+
+
+def _get_window_rect(hwnd):
+    """Returns (left, top, right, bottom) for hwnd, or None on failure.
+    Diagnostic helper only -- used to see where a window actually ended up
+    on screen, before/after reparenting."""
+    if sys.platform != "win32":
+        return None
+    from ctypes import wintypes
+    rect = wintypes.RECT()
+    ok = ctypes.windll.user32.GetWindowRect(wintypes.HWND(hwnd), ctypes.byref(rect))
+    if not ok:
+        return None
+    return (rect.left, rect.top, rect.right, rect.bottom)
+
 
 # Curves are generated at this resolution (on the long edge) no matter how
 # big the real screen is, then scaled up when drawing -- redrawing tens or
@@ -356,6 +453,7 @@ def reparent_behind_desktop_icons(hwnd):
     from ctypes import wintypes
 
     user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
 
     user32.FindWindowW.restype = wintypes.HWND
     user32.FindWindowW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR]
@@ -370,6 +468,7 @@ def reparent_behind_desktop_icons(hwnd):
     ]
 
     progman = user32.FindWindowW("Progman", None)
+    _debug_log(f"reparent: Progman hwnd={progman}")
     if not progman:
         return False
 
@@ -380,6 +479,7 @@ def reparent_behind_desktop_icons(hwnd):
     user32.SendMessageTimeoutW(progman, 0x052C, 0, 0, 0x0, 1000, ctypes.byref(result))
 
     target_workerw = [None]
+    all_workerw_seen = []  # diagnostic only: every top-level WorkerW hwnd + its screen rect
 
     @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
     def _enum_windows_cb(hwnd_top, _lparam):
@@ -393,50 +493,40 @@ def reparent_behind_desktop_icons(hwnd):
                 target_workerw[0] = candidate
         return True
 
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    def _enum_all_workerw_cb(hwnd_top, _lparam):
+        # Diagnostic pass only: log every top-level window of class
+        # "WorkerW" and where it sits on screen, so a debug log can show
+        # whether more than one exists and which one we actually picked.
+        buf = ctypes.create_unicode_buffer(256)
+        ctypes.windll.user32.GetClassNameW(hwnd_top, buf, 256)
+        if buf.value == "WorkerW":
+            all_workerw_seen.append((hwnd_top, _get_window_rect(hwnd_top)))
+        return True
+
     user32.EnumWindows(_enum_windows_cb, 0)
+    user32.EnumWindows(_enum_all_workerw_cb, 0)
+
+    _debug_log(f"reparent: all top-level WorkerW windows seen: {all_workerw_seen}")
+    _debug_log(f"reparent: chosen target_workerw={target_workerw[0]}, "
+               f"rect={_get_window_rect(target_workerw[0]) if target_workerw[0] else None}")
 
     if not target_workerw[0]:
         return False
 
-    user32.SetParent(hwnd, target_workerw[0])
+    rect_before = _get_window_rect(hwnd)
+    kernel32.SetLastError(0)
+    prev_parent = user32.SetParent(hwnd, target_workerw[0])
+    if not prev_parent:
+        err = kernel32.GetLastError()
+        _debug_log(f"reparent: SetParent FAILED, GetLastError={err}, "
+                   f"hwnd={hwnd}, target={target_workerw[0]}, rect_before={rect_before}")
+        return False
+
+    rect_after = _get_window_rect(hwnd)
+    _debug_log(f"reparent: SetParent OK, prev_parent={prev_parent}, "
+               f"rect_before={rect_before}, rect_after={rect_after}")
     return True
-
-
-def _make_dpi_aware():
-    """Tell Windows this process handles its own DPI scaling, *before*
-    anything else touches a window or GetSystemMetrics.
-
-    Order matters: if this runs after tk.Tk()/geometry() (as it used to,
-    inside WallpaperWindow.__init__), Windows has already handed out
-    DPI-virtualized (scaled) coordinates for monitor geometry and window
-    placement, based on whatever monitor the process *happened* to be
-    considered "on" at that point. On a mixed-DPI multi-monitor setup this
-    can put the window's real on-screen rectangle somewhere other than
-    where the math intended -- e.g. covering/intercepting input on a
-    different monitor than the one the wallpaper is meant to render on,
-    which looks exactly like "the monitor the GUI is on stops accepting
-    clicks." Calling this first, before any Tk/window/monitor call, makes
-    every subsequent coordinate physical-pixel and monitor-accurate.
-
-    Prefers per-monitor-v2 DPI awareness (correct for mixed-DPI multi-monitor
-    rigs) and falls back to the older system-DPI-only API on Windows
-    versions that don't have it, or to doing nothing at all if both fail --
-    a slightly blurry wallpaper beats a crash."""
-    if sys.platform != "win32":
-        return
-    try:
-        # DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 == -4. Needs an
-        # explicit c_void_p so ctypes doesn't try to pass -4 as a 32-bit
-        # int on 64-bit Windows.
-        ok = ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
-        if ok:
-            return
-    except (AttributeError, OSError):
-        pass  # older Windows without per-monitor-v2 support
-    try:
-        ctypes.windll.user32.SetProcessDPIAware()
-    except Exception:
-        pass
 
 
 # --- Tkinter rendering ---------------------------------------------------
@@ -470,6 +560,17 @@ class WallpaperWindow:
         if monitor_mode not in ("primary", "all"):
             monitor_mode = "primary"
         self.x, self.y, self.w, self.h = _virtual_screen_bounds(self.root, monitor_mode)
+        if sys.platform == "win32":
+            u32 = ctypes.windll.user32
+            _debug_log(
+                f"monitor_mode={monitor_mode}, chosen bounds=({self.x},{self.y},{self.w},{self.h}); "
+                f"for comparison -- SM_CXSCREEN/CYSCREEN (primary monitor)="
+                f"({u32.GetSystemMetrics(0)},{u32.GetSystemMetrics(1)}), "
+                f"SM_X/YVIRTUALSCREEN+CX/CYVIRTUALSCREEN (all monitors)="
+                f"({u32.GetSystemMetrics(76)},{u32.GetSystemMetrics(77)},"
+                f"{u32.GetSystemMetrics(78)},{u32.GetSystemMetrics(79)}), "
+                f"SM_CMONITORS (monitor count)={u32.GetSystemMetrics(80)}"
+            )
         self.root.overrideredirect(True)
         self.root.geometry(f"{self.w}x{self.h}+{self.x}+{self.y}")
         self.root.configure(bg=self.cfg.get("bg_color", "#0b1220"))
@@ -490,11 +591,29 @@ class WallpaperWindow:
             root_hwnd = self.root.winfo_id()
         except tk.TclError:
             root_hwnd = hwnd
+        _debug_log(f"root_hwnd={root_hwnd}, canvas_hwnd={hwnd}, "
+                   f"root rect before reparent={_get_window_rect(root_hwnd)}")
         reparented = reparent_behind_desktop_icons(root_hwnd)
         if not reparented:
             print("Could not attach behind the desktop icons "
                   "(WorkerW trick did not find its target) -- "
                   "falling back to a normal window instead.")
+            _debug_log("reparenting FAILED -- falling back to a normal top-level window. "
+                       "Lowering it in the normal z-order as a safety net so it can't "
+                       "sit on top of (and block clicks to) other apps like gui.py.")
+            # Reparenting failed, so this stayed a normal top-level window
+            # instead of becoming a desktop-layer child -- a new top-level
+            # window can otherwise land above other apps in z-order and
+            # (being borderless and full-monitor) silently eat their
+            # clicks. lower() pushes it to the bottom of the *normal*
+            # z-order as a safety net; it's not the real "behind icons"
+            # look, but it can no longer block input to anything else.
+            try:
+                self.root.lower()
+            except tk.TclError:
+                pass
+        else:
+            _debug_log(f"root rect after reparent={_get_window_rect(root_hwnd)}")
 
         self._phase = 0.0
         self._last_tick = time.time()
@@ -593,11 +712,8 @@ class WallpaperWindow:
 
 
 def main():
-    # Must be the very first Windows API call in the process -- before any
-    # Tk window is created or any monitor geometry is read -- so every
-    # coordinate downstream of this is physical-pixel and monitor-accurate.
-    # See _make_dpi_aware()'s docstring for why this used to be a bug.
-    _make_dpi_aware()
+    _debug_log(f"=== wallpaper_engine.py starting, pid={os.getpid()} ===")
+    _debug_log(f"DPI awareness result: {DPI_AWARENESS_RESULT}")
 
     test_seconds = None
     for i, arg in enumerate(sys.argv):
