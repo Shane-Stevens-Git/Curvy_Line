@@ -1353,6 +1353,23 @@ class CurveApp(tk.Tk):
         ttk.Radiobutton(mon_row, text="Stretch across all monitors", value="all", variable=self._wp_monitor_var,
                          command=self._wp_monitor_changed).pack(anchor="w")
 
+        ttk.Label(pad, text="Rendering").grid(row=grow, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        grow += 1
+        self._wp_reparent_var = tk.BooleanVar(value=bool(self._wp_cfg.get("attempt_worker_reparent", False)))
+        ttk.Checkbutton(pad, text="Render behind desktop icons (experimental)",
+                         variable=self._wp_reparent_var, command=self._wp_reparent_changed).grid(
+            row=grow, column=0, columnspan=2, sticky="w")
+        grow += 1
+        ttk.Label(pad, text="Off by default because this froze all clicks on the\n"
+                            "monitor the wallpaper was on until it was fixed by\n"
+                            "testing. With it off (recommended), the wallpaper sits\n"
+                            "on top of your icons instead of behind them -- clicks\n"
+                            "still reach them, you just can't see them to aim. Only\n"
+                            "turn this on if you want to try the behind-icons look\n"
+                            "again and are prepared for that freeze to come back.",
+                  foreground="#a15c00").grid(row=grow, column=0, columnspan=2, sticky="w", pady=(2, 4))
+        grow += 1
+
         # --- run controls ---
         ttk.Separator(pad, orient="horizontal").grid(row=grow, column=0, columnspan=2, sticky="ew", pady=(14, 10))
         grow += 1
@@ -1457,6 +1474,9 @@ class CurveApp(tk.Tk):
 
     def _wp_monitor_changed(self):
         self._wp_cfg["monitor_mode"] = self._wp_monitor_var.get()
+
+    def _wp_reparent_changed(self):
+        self._wp_cfg["attempt_worker_reparent"] = bool(self._wp_reparent_var.get())
 
     def _wp_add_preset(self):
         base = WALLPAPER_DEFAULT_PRESETS[len(self._wp_cfg["presets"]) % len(WALLPAPER_DEFAULT_PRESETS)]
