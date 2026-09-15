@@ -36,7 +36,7 @@ holds the last generated path, colors, and stroke. Just needs a button
 (enabled once something's been generated) that re-runs `_animate_draw`
 against the current state without regenerating anything.
 
-## 3. Color strobe / traveling color effect (after draw animation)
+## 3. Color strobe / traveling color effect (after draw animation) (DONE)
 
 A second, independent animation: once the curve is fully on screen, cycle
 a color gradient along it continuously (like a chase-light effect) until
