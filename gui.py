@@ -214,7 +214,7 @@ class CurveApp(tk.Tk):
             row=row, column=0, columnspan=2, sticky="w", pady=(12, 0))
         row += 1
         self.anim_duration_var = tk.DoubleVar(value=2.5)
-        add_slider("Draw duration (s)", self.anim_duration_var, 0.5, 6.0, 0.5, "{:.1f}")
+        add_slider("Draw duration (s)", self.anim_duration_var, 0.5, 15.0, 0.5, "{:.1f}")
 
         # --- Generate button + progress ---
         self.generate_btn = ttk.Button(parent, text="Generate", command=self._start_generate)
