@@ -76,3 +76,92 @@ or stay fixed, and whether it picks up the shape-fill revamp (#1) once
 that exists. Code-wise it's small; the fiddly part is the Task Scheduler
 setup on the real machine, which is worth doing hands-on rather than
 blind.
+
+## 5. Screensaver mode
+
+Windows screensavers are just `.scr` files (a renamed `.exe` implementing a
+few command-line flags: `/s` to run full-screen, `/c` to show the config
+dialog, `/p <hwnd>` to preview embedded in the small monitor thumbnail in
+Windows' screensaver settings, no args to run in default/preview mode)
+that Windows launches on idle timeout and kills the instant there's input.
+Almost all of `WallpaperWindow`'s rendering code is reusable as-is — same
+canvas, same `crawl_bands` loop, same gradient palette, even the
+background-thread-generation-with-a-spinner pattern we just built for the
+regen button would work nicely here (regenerate fresh each time the
+screensaver kicks in, or just keep showing whatever the wallpaper is
+already on).
+
+What's genuinely different from the wallpaper path: a screensaver must
+close itself the instant it sees mouse movement/clicks or a keypress
+(Windows expects this, and anyone testing it will assume it if it
+doesn't); it needs packaging as an actual `.scr` (built via PyInstaller,
+since this can't run as a bare `.py` the way the wallpaper engine can from
+Task Scheduler) and installing via the registry
+(`HKEY_CURRENT_USER\Control Panel\Desktop`, `SCRNSAVE.EXE` key) — doable
+following install.bat/install.sh's existing pattern, but worth doing
+hands-on on the real machine rather than blind; and it should skip the
+WorkerW desktop-icon reparenting trick (`attempt_worker_reparent`)
+entirely — a screensaver is expected to cover the whole screen on top of
+everything, which sidesteps the current wallpaper's core headache (that
+reparenting-behind-icons is exactly what caused the click-freeze bug that
+made "render behind desktop icons" default off in Configure Wallpaper...).
+Worth calling out: since a screensaver only shows while the user's away,
+it doesn't need input passthrough or click-safety at all — so it's
+legitimately a simpler window to get right than the live wallpaper, not
+just a reskin of it. Medium effort: most of the rendering code already
+exists: the new work is the `.scr` packaging, the idle-close behavior, and
+the install/registry step.
+
+## 6. SVG export for pen plotters
+
+`organic_curve.py` already has `render_svg()` for the "export static
+image" path in gui.py, and the line data itself is already exactly what a
+plotter wants — a single continuous stroke, not a filled shape (that's the
+whole "flowing curve" premise). What plotter export needs on top of that:
+
+- No fill at all, ever — just `stroke`, `fill="none"`, one consistent
+  stroke-width. Worth double-checking today's export never has a filled
+  boundary/background rectangle sneaking in behind the line.
+- As few pen lifts as possible. The current single-strand path is already
+  one continuous line, so this is mostly free today — but if multi-strand
+  mode (a separate idea from this same brainstorm) ships first, it'll need
+  path-ordering logic to minimize travel between strands.
+- Real-world units (mm/inches tied to actual paper size) instead of
+  arbitrary pixel coordinates, since plotter software (AxiDraw's workflow
+  via Inkscape, etc.) wants the SVG's viewBox/width/height mapped straight
+  to the plot bed.
+- Optionally, orient the path so it starts/ends somewhere sensible (e.g.
+  near a corner) rather than mid-canvas, since some plotter drivers home
+  from a fixed start position.
+
+Low-to-medium effort — mostly a new export function alongside `render_svg()`
+with plotter-specific defaults (no fill, mm units, a stroke width entered
+in real units) rather than new generation logic; the geometry to export
+already exists.
+
+## 7. Battery-aware performance throttling (live wallpaper)
+
+The wallpaper engine currently redraws every `FRAME_MS` (50ms, ~20fps)
+nonstop, all day, regardless of power source — fine on a desktop, wasteful
+on a laptop running on battery. Windows exposes power status via
+`GetSystemPowerStatus` (`ctypes.windll.kernel32`), which reports whether AC
+power is connected and the battery percentage. `wallpaper_engine.py` could
+poll this occasionally (every few seconds is plenty — no need to check
+every tick) and respond a couple of ways:
+
+- Drop the frame rate on battery (e.g. `FRAME_MS` 50 → 150 — still smooth
+  enough for a slow chase-light effect, a fraction of the CPU/GPU work).
+- Pause the crawl animation entirely below some battery threshold (e.g.
+  <20%), freezing on the current frame instead of continuing to redraw,
+  and resuming automatically once charging or back above the threshold.
+- Tie it into the existing config (`wallpaper_config.json`) with a simple
+  toggle in Configure Wallpaper... — something like "Reduce animation on
+  battery" next to the existing Rendering section — so it's not a surprise
+  behavior change.
+
+Small-to-medium effort: the power-status check is a few lines (Windows
+-only, same `ctypes` pattern already used for `_make_input_safe`/
+`reparent_behind_desktop_icons`), the throttling itself is just varying
+the `self.root.after(FRAME_MS, self.tick)` delay and/or skipping the
+`crawl_bands` redraw work, and it composes cleanly with everything already
+in `tick()` rather than needing a rewrite.
