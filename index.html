@@ -1,0 +1,494 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Flowing Curve Generator</title>
+<style>
+  :root {
+    --bg: #0b1220;
+    --bg-panel: #121b2e;
+    --bg-panel-2: #0f1729;
+    --border: #26314a;
+    --text: #e7edf7;
+    --text-dim: #9aa7bd;
+    --accent: #ffd166;
+    --accent-2: #7fe7c4;
+    --accent-3: #ff595e;
+    --code-bg: #0a0f1a;
+    --radius: 12px;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    line-height: 1.6;
+    padding-bottom: 4rem;
+  }
+  img { max-width: 100%; display: block; border-radius: var(--radius); }
+  a { color: var(--accent-2); }
+  a:hover { color: var(--accent); }
+
+  .wrap {
+    max-width: 980px;
+    margin: 0 auto;
+    padding: 0 1.5rem;
+  }
+
+  header.hero {
+    padding: 3.5rem 0 2.5rem;
+    text-align: center;
+    background:
+      radial-gradient(ellipse 70% 60% at 50% 0%, rgba(255, 209, 102, 0.08), transparent),
+      var(--bg);
+    border-bottom: 1px solid var(--border);
+  }
+  header.hero h1 {
+    font-size: clamp(1.8rem, 4vw, 2.6rem);
+    margin: 0 0 0.5rem;
+    letter-spacing: -0.02em;
+  }
+  header.hero p.tagline {
+    color: var(--text-dim);
+    font-size: 1.1rem;
+    max-width: 40rem;
+    margin: 0 auto 2rem;
+  }
+  header.hero .hero-shot {
+    max-width: 900px;
+    margin: 0 auto;
+    border: 1px solid var(--border);
+    box-shadow: 0 20px 60px rgba(0,0,0,0.45);
+  }
+  .badges {
+    display: flex;
+    gap: 0.5rem;
+    justify-content: center;
+    flex-wrap: wrap;
+    margin-bottom: 1.5rem;
+  }
+  .badge {
+    font-size: 0.78rem;
+    color: var(--text-dim);
+    border: 1px solid var(--border);
+    background: var(--bg-panel);
+    padding: 0.25rem 0.65rem;
+    border-radius: 999px;
+  }
+
+  main { padding-top: 3rem; }
+
+  section { margin-bottom: 3.5rem; }
+  h2 {
+    font-size: 1.5rem;
+    margin: 0 0 1rem;
+    padding-bottom: 0.6rem;
+    border-bottom: 1px solid var(--border);
+  }
+  h3 { font-size: 1.1rem; margin: 1.5rem 0 0.5rem; color: var(--text); }
+  p { color: var(--text-dim); }
+  p.lead { color: var(--text); font-size: 1.05rem; }
+
+  .gallery {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+    gap: 1rem;
+  }
+  figure { margin: 0; }
+  figure img { border: 1px solid var(--border); }
+  figcaption {
+    color: var(--text-dim);
+    font-size: 0.85rem;
+    margin-top: 0.4rem;
+    text-align: center;
+  }
+
+  .feature-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+    gap: 1rem;
+  }
+  .feature {
+    background: var(--bg-panel);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 1.1rem 1.2rem;
+  }
+  .feature h4 {
+    margin: 0 0 0.4rem;
+    font-size: 1rem;
+    color: var(--accent);
+  }
+  .feature p { margin: 0; font-size: 0.92rem; }
+
+  .panel {
+    background: var(--bg-panel);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 1.3rem 1.5rem;
+    margin: 1rem 0;
+  }
+  .panel h3 { margin-top: 0; }
+
+  code {
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 5px;
+    padding: 0.1rem 0.4rem;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 0.88em;
+    color: var(--accent-2);
+  }
+  pre {
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 1rem 1.1rem;
+    overflow-x: auto;
+  }
+  pre code {
+    background: none;
+    border: none;
+    padding: 0;
+    color: var(--text);
+    font-size: 0.88rem;
+  }
+
+  ol.steps, ul.list { padding-left: 1.3rem; color: var(--text-dim); }
+  ol.steps li, ul.list li { margin-bottom: 0.5rem; }
+  ol.steps li::marker { color: var(--accent); font-weight: 600; }
+
+  .two-col {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 1.2rem;
+  }
+  @media (max-width: 700px) {
+    .two-col { grid-template-columns: 1fr; }
+  }
+
+  .usage-block {
+    display: grid;
+    grid-template-columns: 220px 1fr;
+    gap: 0.3rem 1.2rem;
+    padding: 0.7rem 0;
+    border-bottom: 1px solid var(--border);
+  }
+  .usage-block:last-child { border-bottom: none; }
+  .usage-block dt {
+    font-weight: 600;
+    color: var(--text);
+  }
+  .usage-block dd { margin: 0; color: var(--text-dim); font-size: 0.94rem; }
+  @media (max-width: 640px) {
+    .usage-block { grid-template-columns: 1fr; }
+  }
+
+  .section-tag {
+    display: inline-block;
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--bg);
+    background: var(--accent-2);
+    padding: 0.15rem 0.55rem;
+    border-radius: 999px;
+    margin-bottom: 0.8rem;
+    font-weight: 700;
+  }
+  .section-tag.after { background: var(--accent-3); }
+
+  .callout {
+    border-left: 3px solid var(--accent);
+    background: rgba(255, 209, 102, 0.06);
+    padding: 0.8rem 1rem;
+    border-radius: 0 8px 8px 0;
+    font-size: 0.92rem;
+    color: var(--text);
+  }
+
+  footer {
+    text-align: center;
+    color: var(--text-dim);
+    font-size: 0.85rem;
+    padding-top: 2rem;
+    border-top: 1px solid var(--border);
+  }
+
+  table.compat {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.9rem;
+  }
+  table.compat th, table.compat td {
+    text-align: left;
+    padding: 0.5rem 0.7rem;
+    border-bottom: 1px solid var(--border);
+    color: var(--text-dim);
+  }
+  table.compat th { color: var(--text); }
+</style>
+</head>
+<body>
+
+<header class="hero">
+  <div class="wrap">
+    <div class="badges">
+      <span class="badge">Python 3.10+</span>
+      <span class="badge">Desktop app (Tkinter)</span>
+      <span class="badge">Windows / macOS / Linux</span>
+    </div>
+    <h1>Flowing Curve Generator</h1>
+    <p class="tagline">
+      Draws a single, continuous, non-intersecting organic line that fills a shape
+      edge to edge &mdash; like one long strand of string laid down by hand.
+      Pick a shape (or draw your own), tune how it flows, and export it as a
+      PNG or SVG.
+    </p>
+    <img class="hero-shot" src="screenshots/gui-full-app.png" alt="Flowing Curve Generator desktop app, showing a completed curve fill next to the control sidebar">
+  </div>
+</header>
+
+<main class="wrap">
+
+  <section id="what-it-does">
+    <h2>What this is</h2>
+    <p class="lead">
+      <code>organic_curve.py</code> is the algorithm: it grows one unbroken line through a
+      shape, relaxing and re-checking itself so it never crosses or touches its own path,
+      and keeps a consistent breathing-room gap between neighboring strands. <code>gui.py</code>
+      is a desktop app built on top of it &mdash; sliders and buttons instead of command-line flags,
+      with a live preview, a draw-in animation, and a few presentation-only extras like color
+      themes and a looping "chasing lights" animation.
+    </p>
+    <p>
+      Good for generative wallpapers, poster line-art, laser/pen-plotter paths (it exports
+      clean SVG), or just watching a curve fill a shape.
+    </p>
+  </section>
+
+  <section id="gallery">
+    <h2>Examples</h2>
+    <div class="gallery">
+      <figure>
+        <img src="screenshots/example-square.png" alt="Example organic curve filling a square">
+        <figcaption>Square fill</figcaption>
+      </figure>
+      <figure>
+        <img src="screenshots/example-star.png" alt="Example organic curve filling a star shape">
+        <figcaption>Star fill</figcaption>
+      </figure>
+      <figure>
+        <img src="screenshots/example-rect.png" alt="Example organic curve filling a widescreen rectangular canvas">
+        <figcaption>Widescreen (16:9) canvas</figcaption>
+      </figure>
+      <figure>
+        <img src="screenshots/example-crawl.png" alt="A frame of the color crawl chasing-lights animation, in three colors">
+        <figcaption>Color crawl (chasing lights)</figcaption>
+      </figure>
+    </div>
+  </section>
+
+  <section id="features">
+    <h2>Features</h2>
+    <div class="feature-grid">
+      <div class="feature">
+        <h4>Fill shapes</h4>
+        <p>Square, circle, triangle, diamond, pentagon, hexagon, octagon, star &mdash; or draw
+        your own closed boundary freehand on the preview.</p>
+      </div>
+      <div class="feature">
+        <h4>Any canvas size</h4>
+        <p>Square by default, or unlink width/height for any rectangle &mdash; including a
+        1920&times;1080 wallpaper preset &mdash; filled edge to edge with no cropping.</p>
+      </div>
+      <div class="feature">
+        <h4>Draw-in animation</h4>
+        <p>Watch the curve get traced stroke by stroke, like a pen drawing it, with a
+        skip button and an adjustable duration.</p>
+      </div>
+      <div class="feature">
+        <h4>Color crawl</h4>
+        <p>A looping "chasing lights" animation: 3 customizable colors chase down the
+        already-drawn curve, with adjustable crawler size, gap, and speed.</p>
+      </div>
+      <div class="feature">
+        <h4>Live appearance controls</h4>
+        <p>Line color, background color, and display stroke width are pure presentation
+        &mdash; they re-render instantly without recomputing the curve.</p>
+      </div>
+      <div class="feature">
+        <h4>Export</h4>
+        <p>Save any result as PNG or SVG (with a validation report alongside it) for
+        printing, plotting, or use as a desktop/phone wallpaper.</p>
+      </div>
+    </div>
+  </section>
+
+  <section id="setup">
+    <h2>Setup</h2>
+    <p>You need <a href="https://www.python.org/downloads/" target="_blank" rel="noopener">Python 3.10 or newer</a>.
+    On Windows and macOS, Python's installer already includes Tkinter (the GUI toolkit this
+    app is built with) &mdash; nothing extra to install there. On Linux, if the app complains
+    Tkinter is missing, install it via your package manager (e.g. <code>sudo apt install python3-tk</code>
+    on Debian/Ubuntu).</p>
+
+    <div class="two-col">
+      <div class="panel">
+        <h3>Option A &mdash; one-click launcher</h3>
+        <p>Easiest path. These scripts create a virtual environment, install the
+        dependencies, and start the app &mdash; the first run takes a little longer while
+        it sets things up; every run after that is instant.</p>
+        <p><strong>Windows:</strong> double-click <code>run.bat</code></p>
+        <p><strong>macOS / Linux:</strong> in a terminal, in this folder:</p>
+        <pre><code>./run.sh</code></pre>
+        <p style="font-size:0.85rem;">(First time only, you may need <code>chmod +x run.sh</code> to make it executable.)</p>
+      </div>
+      <div class="panel">
+        <h3>Option B &mdash; manual setup</h3>
+        <p>If you'd rather do it yourself, or already manage your own virtual environments:</p>
+        <pre><code># from inside the project folder
+python -m venv .venv
+
+# Windows
+.venv\Scripts\activate
+
+# macOS / Linux
+source .venv/bin/activate
+
+pip install -r requirements.txt
+python gui.py</code></pre>
+      </div>
+    </div>
+
+    <div class="callout">
+      Nothing here needs an internet connection once dependencies are installed, and
+      nothing you generate leaves your machine &mdash; it's a fully local desktop app.
+    </div>
+  </section>
+
+  <section id="usage">
+    <h2>How to use it</h2>
+    <p>The sidebar is scrollable and split into two halves: everything above
+    <strong>Generate</strong> shapes what gets made; everything below it presents,
+    replays, or saves the curve you already generated.</p>
+
+    <img src="screenshots/gui-sidebar-top.png" alt="Top of the Flowing Curve Generator sidebar, showing the pre-generation controls" style="margin: 1rem 0; border: 1px solid var(--border);">
+
+    <span class="section-tag">Before you click Generate</span>
+    <dl>
+      <div class="usage-block">
+        <dt>Seed</dt>
+        <dd>The random seed driving the layout. Same seed + same settings always
+        reproduces the same curve; hit <strong>Random</strong> for a new one.</dd>
+      </div>
+      <div class="usage-block">
+        <dt>Fill shape</dt>
+        <dd>Pick a preset shape from the dropdown, or click <strong>Draw custom
+        boundary...</strong> and drag a closed loop directly on the preview to fill
+        a shape of your own. <strong>Clear</strong> removes a drawn boundary.</dd>
+      </div>
+      <div class="usage-block">
+        <dt>Width / Height</dt>
+        <dd>Canvas size in pixels. Leave <strong>Square (link width/height)</strong>
+        checked to keep them equal, or uncheck it for a rectangle. The
+        <strong>1920&times;1080</strong> and <strong>Square 1200</strong> buttons are quick
+        presets. Larger canvases take longer &mdash; a 1200px square is roughly 30&ndash;60
+        seconds; a full 1920&times;1080 canvas can take a minute or two.</dd>
+      </div>
+      <div class="usage-block">
+        <dt>Stroke width</dt>
+        <dd>Line thickness <em>at generation time</em> &mdash; this affects how tightly
+        the curve can pack itself, not just how it looks.</dd>
+      </div>
+      <div class="usage-block">
+        <dt>Smoothness</dt>
+        <dd>How tightly (low) or loosely (high) the curve winds &mdash; from tight
+        switchbacks to broad, round sweeps.</dd>
+      </div>
+      <div class="usage-block">
+        <dt>Advanced settings</dt>
+        <dd>Collapsed by default. Fine-tuning knobs: minimum ink gap, preferred gap,
+        edge clearance, relax iterations, edge wave, and search attempts &mdash; the
+        underlying algorithm's parameters, for anyone who wants to push past the defaults.</dd>
+      </div>
+      <div class="usage-block">
+        <dt>Animate drawing / Draw duration</dt>
+        <dd>Toggles the pen-tracing reveal animation after a generation finishes, and
+        how long it takes to play out.</dd>
+      </div>
+      <div class="usage-block">
+        <dt>Replay animation</dt>
+        <dd>Re-plays the draw-in reveal for the curve you already generated (using
+        whatever colors/stroke are currently selected) &mdash; no recomputation.</dd>
+      </div>
+      <div class="usage-block">
+        <dt>Generate</dt>
+        <dd>Runs the algorithm with the settings above. The progress bar and status
+        line track it; <strong>Skip animation</strong> jumps straight to the finished frame
+        if the draw-in reveal is running.</dd>
+      </div>
+    </dl>
+
+    <span class="section-tag after">After you have a result</span>
+    <dl>
+      <div class="usage-block">
+        <dt>Appearance</dt>
+        <dd>Line and background color, plus <strong>Display stroke</strong> &mdash; all
+        pure presentation, so they instantly re-render the already-computed curve
+        instead of regenerating it. Display stroke is capped so it can never thicken
+        enough to make the line touch itself.</dd>
+      </div>
+      <div class="usage-block">
+        <dt>Color crawl</dt>
+        <dd>A looping "chasing lights" animation along the finished curve. Pick 3
+        colors, and adjust crawler size, the gap between crawlers, and crawl speed
+        &mdash; all update live while it's running. <strong>Start/Stop crawl</strong> toggles it.</dd>
+      </div>
+      <div class="usage-block">
+        <dt>Save As...</dt>
+        <dd>Saves the current result as a PNG or SVG file (plus a JSON validation
+        report alongside it) wherever you choose.</dd>
+      </div>
+      <div class="usage-block">
+        <dt>Clear saved copies</dt>
+        <dd>Empties the app's own <code>outputs/</code> working folder of anything
+        you've saved there before &mdash; the current on-screen preview is kept.</dd>
+      </div>
+    </dl>
+  </section>
+
+  <section id="notes">
+    <h2>Good to know</h2>
+    <ul class="list">
+      <li>Generation runs in a background thread, so the window stays responsive while
+      it works &mdash; you can watch the progress bar rather than the app freezing.</li>
+      <li>A drawn custom boundary is tied to the width/height it was drawn at; changing
+      the canvas size afterward clears it, so it never silently fills a stale shape.</li>
+      <li>Every Generate overwrites one set of preview files in <code>outputs/</code>
+      (nothing ever collides with a previous run) &mdash; use <strong>Save As...</strong>
+      when you land on a result worth keeping.</li>
+    </ul>
+  </section>
+
+  <section id="project-structure">
+    <h2>Project files</h2>
+    <table class="compat">
+      <tr><th>File</th><th>What it is</th></tr>
+      <tr><td><code>organic_curve.py</code></td><td>The generation algorithm and PNG/SVG rendering &mdash; usable standalone from the command line, or imported by the GUI.</td></tr>
+      <tr><td><code>gui.py</code></td><td>The desktop app (this is what <code>run.bat</code> / <code>run.sh</code> launch).</td></tr>
+      <tr><td><code>requirements.txt</code></td><td>Python dependencies (numpy, scipy, shapely, Pillow).</td></tr>
+      <tr><td><code>run.bat</code> / <code>run.sh</code></td><td>One-click setup + launch, for Windows and macOS/Linux respectively.</td></tr>
+      <tr><td><code>outputs/</code></td><td>Where the app writes the current preview and anything saved with "Save As...".</td></tr>
+    </table>
+  </section>
+
+  <footer>
+    Flowing Curve Generator &middot; open this file (<code>index.html</code>) directly in any browser to read these docs offline.
+  </footer>
+
+</main>
+</body>
+</html>

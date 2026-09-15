@@ -1,0 +1,15 @@
+# Flowing Curve Generator -- dependencies
+#
+# Install with:  pip install -r requirements.txt
+# (run.bat / run.sh do this for you automatically)
+#
+# Tkinter (the GUI toolkit) is NOT listed here -- it ships with Python
+# itself on Windows and macOS. On Linux, install it via your package
+# manager if "python gui.py" complains it's missing, e.g.:
+#   Debian/Ubuntu:  sudo apt install python3-tk
+#   Fedora:         sudo dnf install python3-tkinter
+
+numpy>=1.24
+scipy>=1.10
+shapely>=2.0
+Pillow>=10.0
