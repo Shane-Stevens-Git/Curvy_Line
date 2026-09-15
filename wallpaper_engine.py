@@ -867,6 +867,7 @@ class WallpaperWindow:
 
         self._phase = 0.0
         self._last_tick = time.time()
+        self._spinner_angle = 0.0
 
     def _start_generation(self):
         """Kick off generate() on a background thread for whichever
@@ -917,6 +918,16 @@ class WallpaperWindow:
         self.display_scale = display_scale
         self._phase = 0.0
 
+    def _draw_spinner(self, cx, cy, radius, width, color="#ffffff"):
+        """A simple rotating-arc loading spinner, drawn fresh each tick at
+        self._spinner_angle (advanced in tick()). Used both for the
+        centered "nothing to show yet" cold-start case and, smaller, next
+        to the corner text during a mid-run regen."""
+        self.canvas.create_arc(
+            cx - radius, cy - radius, cx + radius, cy + radius,
+            start=self._spinner_angle, extent=100,
+            style=tk.ARC, outline=color, width=max(1.0, width))
+
     def tick(self):
         self._poll_generation()
         # Mid-run day rollover: check every tick (cheap: one string
@@ -941,6 +952,10 @@ class WallpaperWindow:
         now = time.time()
         dt = max(0.0, min(0.25, now - self._last_tick))  # clamp a stall/lag spike
         self._last_tick = now
+        # 220 deg/sec is a brisk, clearly-spinning rate without being
+        # distracting -- only matters visually while a spinner is actually
+        # being drawn below, but cheap enough to just always advance.
+        self._spinner_angle = (self._spinner_angle - 220.0 * dt) % 360.0
 
         self.canvas.delete("all")
         if self.path is not None:
@@ -959,22 +974,52 @@ class WallpaperWindow:
                 self.canvas.create_line(*coords, fill=palette[color_idx],
                                          width=max(1.0, stroke),
                                          capstyle=tk.ROUND, joinstyle=tk.ROUND)
-        # else: first curve is still generating in the background -- leave
-        # the plain background color showing instead of erroring, since
-        # there's nothing to draw yet.
+        else:
+            # Nothing generated yet -- either this is the very first curve
+            # ever (fresh install) or today's cache was just cleared and
+            # this engine instance is only starting up now, so there's no
+            # old curve to keep showing while the new one generates. A
+            # full-resolution wallpaper curve can take several minutes, so
+            # a plain empty background here reads as frozen/broken -- show
+            # a centered spinner instead so it's clearly working.
+            cx, cy = self.w / 2, self.h / 2
+            radius = max(24, int(36 * self.display_scale))
+            self._draw_spinner(cx, cy, radius, max(2.0, 3.0 * self.display_scale))
+            self.canvas.create_text(
+                cx, cy + radius + max(14, int(20 * self.display_scale)),
+                text="Generating your curve... this can take a few minutes",
+                fill="#ffffff",
+                font=("Segoe UI", max(10, int(14 * self.display_scale))),
+                anchor="n")
 
         if self._loading_message:
             # Only shown for an explicit user-requested regen (see tick()
             # above) -- not on ordinary silent daily rollover, so the
             # wallpaper doesn't pop up unprompted text every night. Drawn
             # on top of the still-crawling old curve, bottom-right corner
-            # so it doesn't sit under any desktop icons up top.
+            # so it doesn't sit under any desktop icons up top. A solid
+            # backdrop behind the text+spinner keeps them legible no
+            # matter what color curve happens to be crawling underneath
+            # (a plain white spinner/text can otherwise disappear against
+            # a light-colored line at that exact spot).
             margin = max(16, int(24 * self.display_scale))
-            self.canvas.create_text(
-                self.w - margin, self.h - margin,
+            spin_radius = max(9, int(11 * self.display_scale))
+            spin_gap = max(10, int(12 * self.display_scale))
+            text_id = self.canvas.create_text(
+                self.w - margin - spin_radius * 2 - spin_gap, self.h - margin,
                 text=self._loading_message, fill="#ffffff",
                 font=("Segoe UI", max(10, int(14 * self.display_scale))),
                 anchor="se")
+            text_bbox = self.canvas.bbox(text_id)
+            pad = max(8, int(10 * self.display_scale))
+            backdrop_id = self.canvas.create_rectangle(
+                text_bbox[0] - spin_radius * 2 - spin_gap - pad, text_bbox[1] - pad,
+                self.w - margin + pad, text_bbox[3] + pad,
+                fill=self.cfg.get("bg_color", "#0b1220"), outline="")
+            self.canvas.tag_lower(backdrop_id, text_id)
+            spin_cx = text_bbox[0] - spin_gap - spin_radius
+            spin_cy = (text_bbox[1] + text_bbox[3]) / 2
+            self._draw_spinner(spin_cx, spin_cy, spin_radius, max(2.0, 2.5 * self.display_scale))
 
         self.root.after(FRAME_MS, self.tick)
 

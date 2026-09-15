@@ -1411,11 +1411,12 @@ class CurveApp(tk.Tk):
             row=rrow, column=0, columnspan=3, sticky="ew", pady=(10, 0))
         rrow += 1
         ttk.Label(pad, text="Don't like the curve today's preset came out with? This\n"
-                            "clears it and generates a fresh random one in its place --\n"
-                            "same preset, same day in the rotation, just a new seed. If\n"
-                            "the wallpaper is running, today's curve keeps showing (with\n"
-                            "a small \"Generating a new curve...\" note) until the new one\n"
-                            "is ready, then it swaps in on its own -- no restart needed.",
+                            "clears it immediately and generates a fresh random one in\n"
+                            "its place -- same preset, same day in the rotation, just a\n"
+                            "new seed. A full-resolution curve can take several minutes,\n"
+                            "so a loading spinner shows the whole time -- if the wallpaper\n"
+                            "is already running, today's curve keeps crawling underneath\n"
+                            "it until the new one swaps in on its own, no restart needed.",
                   foreground="#666").grid(row=rrow, column=0, columnspan=3, sticky="w", pady=(2, 4))
         rrow += 1
 
@@ -1644,9 +1645,9 @@ class CurveApp(tk.Tk):
         midnight day-rollover. Whichever engine is actually running picks
         it up on its own within a fraction of a second, regenerates in the
         background while the current curve keeps crawling on screen (with
-        a small "Generating a new curve..." note), and swaps the new one
-        in automatically the moment it's ready -- no restart, no close and
-        reopen, nothing else for the user to do."""
+        a small loading spinner and "Generating a new curve..." note), and
+        swaps the new one in automatically the moment it's ready -- no
+        restart, no close and reopen, nothing else for the user to do."""
         today = date.today().isoformat()
         cleared = 0
         if WALLPAPER_CACHE_DIR.exists():
@@ -1666,14 +1667,16 @@ class CurveApp(tk.Tk):
 
         messagebox.showinfo(
             "New curve requested",
-            "Cleared today's cached curve and asked the wallpaper for a "
-            "fresh random one.\n\n"
+            "Today's cached curve was cleared immediately.\n\n"
             "If the wallpaper is currently running (from this app or an "
-            "earlier session), today's curve will keep showing as usual "
-            "with a small \"Generating a new curve...\" note until the new "
-            "one is ready -- it'll then swap in on its own, no restart "
-            "needed. If it isn't running, the next time you start it, "
-            "it'll generate fresh instead of reusing today's.",
+            "earlier session), today's curve will keep crawling as usual "
+            "while the new one generates, with a small loading spinner and "
+            "\"Generating a new curve...\" note in the corner -- it'll then "
+            "swap in on its own, no restart needed. If it isn't running, "
+            "starting it now will show a centered loading spinner instead, "
+            "since there's no old curve to keep showing.\n\n"
+            "Either way, generating a full-resolution curve can take "
+            "several minutes -- that's expected, not frozen.",
             parent=self._wallpaper_dialog)
 
 
