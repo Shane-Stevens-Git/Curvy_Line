@@ -13,6 +13,12 @@ result worth keeping, "Save As..." copies that preview out under a name you
 choose; "Clear saved copies" empties the outputs folder if it's built up a
 lot of keepers you no longer want.
 
+With "Animate drawing" on, the finished curve is revealed stroke-by-stroke
+on a canvas (like watching a pen trace it) instead of just popping in as a
+static image; "Skip" jumps straight to the finished frame. The animation is
+just a progressive reveal of the already-computed path for playback -- it
+does not change what gets generated, saved, or validated.
+
 Run with the same interpreter you used for organic_curve.py, e.g.:
     .venv\\Scripts\\python.exe gui.py          (Windows)
     .venv/bin/python gui.py                    (macOS/Linux)
@@ -49,6 +55,8 @@ class CurveApp(tk.Tk):
         self.last_size = None
         self.last_stroke = None
         self.preview_photo = None  # keep a reference so Tk doesn't garbage-collect it
+        self._gen_token = 0      # invalidates a stale/superseded animation when a new run starts
+        self._anim_skip = False  # set by the Skip button to jump the running animation to the end
 
         OUTPUT_DIR.mkdir(exist_ok=True)
 
@@ -151,6 +159,14 @@ class CurveApp(tk.Tk):
         ttk.Label(self.advanced_frame, text="1200px takes ~30-60s. Try 500-600\nwhile experimenting.",
                   foreground="#666").grid(row=adv_row, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
+        # --- Animation ---
+        self.animate_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(parent, text="Animate drawing", variable=self.animate_var).grid(
+            row=row, column=0, columnspan=2, sticky="w", pady=(12, 0))
+        row += 1
+        self.anim_duration_var = tk.DoubleVar(value=2.5)
+        add_slider("Draw duration (s)", self.anim_duration_var, 0.5, 6.0, 0.5, "{:.1f}")
+
         # --- Generate button + progress ---
         self.generate_btn = ttk.Button(parent, text="Generate", command=self._start_generate)
         self.generate_btn.grid(row=row, column=0, columnspan=2, sticky="ew", pady=(16, 4))
@@ -158,6 +174,10 @@ class CurveApp(tk.Tk):
 
         self.progress = ttk.Progressbar(parent, mode="determinate", maximum=100)
         self.progress.grid(row=row, column=0, columnspan=2, sticky="ew")
+        row += 1
+
+        self.skip_btn = ttk.Button(parent, text="Skip animation", command=self._skip_animation, state="disabled")
+        self.skip_btn.grid(row=row, column=0, columnspan=2, sticky="ew", pady=(4, 0))
         row += 1
 
         self.status_var = tk.StringVar(value="Ready.")
@@ -176,9 +196,12 @@ class CurveApp(tk.Tk):
     def _build_preview(self, parent):
         parent.columnconfigure(0, weight=1)
         parent.rowconfigure(0, weight=1)
-        self.preview_label = ttk.Label(parent, anchor="center", background="#111",
-                                        text="Nothing generated yet", foreground="#888")
-        self.preview_label.grid(row=0, column=0, sticky="nsew")
+        self.preview_canvas = tk.Canvas(parent, width=PREVIEW_DISPLAY_SIZE, height=PREVIEW_DISPLAY_SIZE,
+                                         background="#111", highlightthickness=0)
+        self.preview_canvas.grid(row=0, column=0, sticky="nsew")
+        self._placeholder_text_id = self.preview_canvas.create_text(
+            PREVIEW_DISPLAY_SIZE / 2, PREVIEW_DISPLAY_SIZE / 2,
+            text="Nothing generated yet", fill="#888")
 
         self.info_var = tk.StringVar(value="")
         ttk.Label(parent, textvariable=self.info_var, foreground="#444").grid(row=1, column=0, sticky="w", pady=(6, 0))
@@ -215,8 +238,11 @@ class CurveApp(tk.Tk):
             return
 
         self.busy = True
+        self._gen_token += 1  # invalidate any still-running animation from a previous generate
+        self._anim_skip = False
         self.generate_btn.config(state="disabled")
         self.save_btn.config(state="disabled")
+        self.skip_btn.config(state="disabled")
         self.progress.config(value=0)
         self.status_var.set("Starting...")
 
@@ -284,15 +310,64 @@ class CurveApp(tk.Tk):
         svg_path.write_text(svg_text)
         json_path.write_text(json.dumps(report, indent=2))
 
-        self._show_preview(img)
         self.info_var.set(
             f"seed={report['seed']}  min gap={report['minimum_nonlocal_ink_gap_px']}px  "
             f"coverage={report['covered_fraction']*100:.0f}%  saved to outputs/{PREVIEW_BASENAME}.png"
         )
 
+        if self.animate_var.get():
+            self._animate_draw(p, params["size"], params["stroke"], img)
+        else:
+            self._show_preview(img)
+
+    # ----------------------------------------------------------- drawing ----
+
+    def _animate_draw(self, p, size, stroke, final_img):
+        """Progressively reveal the already-computed path on the canvas, like
+        watching it get drawn. Purely playback -- the path/image were already
+        fully computed and validated before this runs."""
+        token = self._gen_token
+        self.preview_canvas.delete("all")
+        scale = PREVIEW_DISPLAY_SIZE / size
+        coords = (p * scale).flatten().tolist()  # x0,y0,x1,y1,...
+        n_points = len(coords) // 2
+        if n_points < 2:
+            self._show_preview(final_img)
+            return
+
+        line_id = self.preview_canvas.create_line(
+            *coords[:4], fill="#ffffff", width=max(1.0, stroke * scale),
+            capstyle=tk.ROUND, joinstyle=tk.ROUND)
+
+        duration_ms = max(200, self.anim_duration_var.get() * 1000)
+        frame_ms = 30
+        n_frames = max(1, int(duration_ms / frame_ms))
+        points_per_frame = max(1, n_points // n_frames)
+
+        self.skip_btn.config(state="normal")
+
+        def step(next_point=2):
+            if token != self._gen_token:
+                return  # a newer generation started; abandon this animation
+            if self._anim_skip:
+                next_point = n_points
+            end = min(n_points, next_point + points_per_frame)
+            self.preview_canvas.coords(line_id, *coords[: end * 2])
+            if end >= n_points:
+                self.skip_btn.config(state="disabled")
+                self._show_preview(final_img)  # swap in the crisp anti-aliased render to finish
+                return
+            self.after(frame_ms, lambda: step(end))
+
+        step()
+
+    def _skip_animation(self):
+        self._anim_skip = True
+
     def _on_generation_error(self, message):
         self.busy = False
         self.generate_btn.config(state="normal")
+        self.skip_btn.config(state="disabled")
         self.progress.config(value=0)
         self.status_var.set("Failed - see message.")
         messagebox.showerror("Generation failed", message)
@@ -302,7 +377,9 @@ class CurveApp(tk.Tk):
         scale = min(PREVIEW_DISPLAY_SIZE / w, PREVIEW_DISPLAY_SIZE / h, 1.0)
         disp = img.resize((max(1, int(w * scale)), max(1, int(h * scale))))
         self.preview_photo = ImageTk.PhotoImage(disp)
-        self.preview_label.config(image=self.preview_photo, text="")
+        self.preview_canvas.delete("all")
+        self.preview_canvas.create_image(PREVIEW_DISPLAY_SIZE / 2, PREVIEW_DISPLAY_SIZE / 2,
+                                          anchor="center", image=self.preview_photo)
 
     # ------------------------------------------------------------ saving ----
 
