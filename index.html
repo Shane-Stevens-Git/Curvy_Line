@@ -200,6 +200,39 @@
   }
   .section-tag.after { background: var(--accent-3); }
 
+  .install-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    background: var(--accent);
+    color: #1a1400;
+    font-weight: 700;
+    padding: 0.75rem 1.3rem;
+    border-radius: 8px;
+    text-decoration: none;
+    font-size: 1rem;
+  }
+  .install-btn:hover { background: #ffdd8a; color: #1a1400; }
+  .install-card { position: relative; }
+  .install-card.detected {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 1px var(--accent);
+  }
+  .install-card.detected::before {
+    content: "Detected for your system";
+    position: absolute;
+    top: -0.65rem;
+    left: 1.1rem;
+    background: var(--accent);
+    color: #1a1400;
+    font-size: 0.68rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    padding: 0.2rem 0.55rem;
+    border-radius: 999px;
+  }
+
   .callout {
     border-left: 3px solid var(--accent);
     background: rgba(255, 209, 102, 0.06);
@@ -252,6 +285,43 @@
 </header>
 
 <main class="wrap">
+
+  <section id="install">
+    <h2>Install</h2>
+    <p class="lead">One download does the rest: fetches the project, creates a Python
+    virtual environment, installs dependencies, and opens the app.</p>
+    <p>You'll need <a href="https://www.python.org/downloads/" target="_blank" rel="noopener">Python
+    3.10 or newer</a> installed first &mdash; on Windows, tick "Add python.exe to PATH" during
+    its install. Everything after that, the installer handles for you, and it's safe to run
+    again later to update to the latest version.</p>
+
+    <div class="two-col" id="install-cards">
+      <div class="panel install-card" id="card-windows">
+        <h3>Windows</h3>
+        <p><a class="install-btn" href="https://raw.githubusercontent.com/Shane-Stevens-Git/Curvy_Line/main/install.bat" download="install.bat">&#11015;&nbsp; Download install.bat</a></p>
+        <p style="font-size:0.85rem;">Double-click the downloaded file. If Windows shows a
+        "Windows protected your PC" prompt, click <strong>More info &rarr; Run anyway</strong>
+        &mdash; it's a plain, readable script, not a signed app, so Windows flags it as
+        unrecognized rather than unsafe.</p>
+      </div>
+      <div class="panel install-card" id="card-unix">
+        <h3>macOS / Linux</h3>
+        <p><a class="install-btn" href="https://raw.githubusercontent.com/Shane-Stevens-Git/Curvy_Line/main/install.sh" download="install.sh">&#11015;&nbsp; Download install.sh</a></p>
+        <p style="font-size:0.85rem;">Then, in a terminal, in the folder you saved it to:</p>
+        <pre style="margin:0;"><code>chmod +x install.sh
+./install.sh</code></pre>
+      </div>
+    </div>
+
+    <p style="font-size:0.85rem;">It creates a new <code>FlowingCurveGenerator</code> folder
+    right next to wherever you save the installer &mdash; it doesn't touch anything else on
+    your machine, and you can delete that folder any time to remove it completely.</p>
+
+    <div class="callout">
+      Nothing here needs an internet connection once installed, and nothing you generate
+      leaves your machine &mdash; it's a fully local desktop app.
+    </div>
+  </section>
 
   <section id="what-it-does">
     <h2>What this is</h2>
@@ -328,26 +398,27 @@
   </section>
 
   <section id="setup">
-    <h2>Setup</h2>
-    <p>You need <a href="https://www.python.org/downloads/" target="_blank" rel="noopener">Python 3.10 or newer</a>.
-    On Windows and macOS, Python's installer already includes Tkinter (the GUI toolkit this
-    app is built with) &mdash; nothing extra to install there. On Linux, if the app complains
-    Tkinter is missing, install it via your package manager (e.g. <code>sudo apt install python3-tk</code>
-    on Debian/Ubuntu).</p>
+    <h2>Already have the code, or prefer to do it by hand?</h2>
+    <p>The <a href="#install">Install</a> section above is the easiest path for most people.
+    These are the alternatives, for anyone who already cloned the repository with git, or
+    would rather manage their own virtual environment.</p>
+    <p style="font-size:0.85rem;">On Linux, if the app complains Tkinter is missing, install
+    it via your package manager (e.g. <code>sudo apt install python3-tk</code> on
+    Debian/Ubuntu) &mdash; Windows and macOS already include it with Python itself.</p>
 
     <div class="two-col">
       <div class="panel">
-        <h3>Option A &mdash; one-click launcher</h3>
-        <p>Easiest path. These scripts create a virtual environment, install the
-        dependencies, and start the app &mdash; the first run takes a little longer while
-        it sets things up; every run after that is instant.</p>
+        <h3>Already cloned the repo?</h3>
+        <p>Every clone already includes its own launcher, right next to this page &mdash;
+        it creates a virtual environment, installs dependencies, and starts the app (first
+        run takes a little longer while it sets things up; every run after that is instant).</p>
         <p><strong>Windows:</strong> double-click <code>run.bat</code></p>
         <p><strong>macOS / Linux:</strong> in a terminal, in this folder:</p>
         <pre><code>./run.sh</code></pre>
         <p style="font-size:0.85rem;">(First time only, you may need <code>chmod +x run.sh</code> to make it executable.)</p>
       </div>
       <div class="panel">
-        <h3>Option B &mdash; manual setup</h3>
+        <h3>Manual setup</h3>
         <p>If you'd rather do it yourself, or already manage your own virtual environments:</p>
         <pre><code># from inside the project folder
 python -m venv .venv
@@ -361,11 +432,6 @@ source .venv/bin/activate
 pip install -r requirements.txt
 python gui.py</code></pre>
       </div>
-    </div>
-
-    <div class="callout">
-      Nothing here needs an internet connection once dependencies are installed, and
-      nothing you generate leaves your machine &mdash; it's a fully local desktop app.
     </div>
   </section>
 
@@ -480,7 +546,8 @@ python gui.py</code></pre>
       <tr><td><code>organic_curve.py</code></td><td>The generation algorithm and PNG/SVG rendering &mdash; usable standalone from the command line, or imported by the GUI.</td></tr>
       <tr><td><code>gui.py</code></td><td>The desktop app (this is what <code>run.bat</code> / <code>run.sh</code> launch).</td></tr>
       <tr><td><code>requirements.txt</code></td><td>Python dependencies (numpy, scipy, shapely, Pillow).</td></tr>
-      <tr><td><code>run.bat</code> / <code>run.sh</code></td><td>One-click setup + launch, for Windows and macOS/Linux respectively.</td></tr>
+      <tr><td><code>run.bat</code> / <code>run.sh</code></td><td>One-click setup + launch, for Windows and macOS/Linux respectively &mdash; already in every clone.</td></tr>
+      <tr><td><code>install.bat</code> / <code>install.sh</code></td><td>The standalone installer linked at the top of this page &mdash; downloads the whole project fresh, then hands off to <code>run.bat</code> / <code>run.sh</code> above.</td></tr>
       <tr><td><code>outputs/</code></td><td>Where the app writes the current preview and anything saved with "Save As...".</td></tr>
     </table>
   </section>
@@ -490,5 +557,15 @@ python gui.py</code></pre>
   </footer>
 
 </main>
+
+<script>
+  (function () {
+    var ua = (navigator.userAgent || "") + " " + (navigator.platform || "");
+    var isWindows = /Win/i.test(ua);
+    var id = isWindows ? "card-windows" : "card-unix";
+    var el = document.getElementById(id);
+    if (el) { el.classList.add("detected"); }
+  })();
+</script>
 </body>
 </html>
