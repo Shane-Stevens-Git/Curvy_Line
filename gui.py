@@ -41,7 +41,8 @@ from tkinter import colorchooser, ttk, filedialog, messagebox
 
 from PIL import ImageTk
 
-from organic_curve import generate, render_png, render_svg, GenerationError, max_safe_render_stroke
+from organic_curve import (generate, render_png, render_svg, GenerationError,
+                            max_safe_render_stroke, fill_polygon, FILL_SHAPES)
 
 OUTPUT_DIR = Path(__file__).parent / "outputs"
 PREVIEW_BASENAME = "preview"
@@ -88,6 +89,8 @@ class CurveApp(tk.Tk):
         preview.grid(row=0, column=1, sticky="nsew")
         self._build_preview(preview)
 
+        self._update_shape_preview()  # show the default shape's border right away
+
     def _build_controls(self, parent):
         row = 0
 
@@ -122,9 +125,20 @@ class CurveApp(tk.Tk):
         ttk.Entry(seed_frame, textvariable=self.seed_var, width=10).pack(side="left")
         ttk.Button(seed_frame, text="Random", command=self._randomize_seed).pack(side="left", padx=(6, 0))
 
+        # --- Fill shape (needs a regenerate: changes the actual geometry) ---
+        ttk.Label(parent, text="Fill shape").grid(row=row, column=0, sticky="w", pady=(8, 0))
+        row += 1
+        self.fill_shape_var = tk.StringVar(value="square")
+        shape_combo = ttk.Combobox(parent, textvariable=self.fill_shape_var, values=list(FILL_SHAPES),
+                                    state="readonly", width=12)
+        shape_combo.grid(row=row, column=0, columnspan=2, sticky="w")
+        shape_combo.bind("<<ComboboxSelected>>", self._update_shape_preview)
+        row += 1
+
         # --- Frame size (needs a regenerate: changes the actual geometry) ---
         self.size_var = tk.IntVar(value=1200)
-        add_slider("Frame size (px)", self.size_var, 200, 2000, 50, "{:.0f}")
+        self.size_scale = add_slider("Frame size (px)", self.size_var, 200, 2000, 50, "{:.0f}")
+        self.size_scale.bind("<ButtonRelease-1>", self._update_shape_preview)
         ttk.Label(parent, text="1200px takes ~30-60s to generate. Try\n500-600 while experimenting.",
                   foreground="#666").grid(row=row, column=0, columnspan=2, sticky="w", pady=(0, 4))
         row += 1
@@ -207,6 +221,9 @@ class CurveApp(tk.Tk):
         add_entry("Relax iterations", self.iterations_var)
         add_entry("Edge wave (px)", self.edge_wave_var)
         add_entry("Search attempts", self.attempts_var)
+        # Edge clearance changes the shape's own inset, so keep the border
+        # preview in sync with it too (not just shape/frame size).
+        self.edge_var.trace_add("write", lambda *_a: self._update_shape_preview())
 
         # --- Animation ---
         self.animate_var = tk.BooleanVar(value=True)
@@ -259,6 +276,40 @@ class CurveApp(tk.Tk):
         self.info_var = tk.StringVar(value="")
         ttk.Label(parent, textvariable=self.info_var, foreground="#444").grid(row=1, column=0, sticky="w", pady=(6, 0))
 
+    def _update_shape_preview(self, *_args):
+        """Draw just the outline of the currently selected fill shape (at
+        the current frame size/edge clearance) on the canvas, so you can see
+        what a Generate would fill before spending the time to run one.
+        Whatever was previously generated no longer matches these settings,
+        so this also resets the controls that depend on a live result."""
+        if self.busy:
+            return  # don't clobber a generation/animation in progress
+        try:
+            size = self.size_var.get()
+            edge = self.edge_var.get()
+            shape = self.fill_shape_var.get()
+            region = fill_polygon(shape, size, edge)
+        except (tk.TclError, GenerationError):
+            return  # mid-edit / momentarily invalid combination -- leave the canvas as-is
+
+        self.last_path = None
+        self.last_report = None
+        self.save_btn.config(state="disabled")
+        self.replay_btn.config(state="disabled")
+        self.display_stroke_scale.config(state="disabled")
+        self.display_stroke_label.config(text="--")
+
+        scale = PREVIEW_DISPLAY_SIZE / size
+        coords = []
+        for x, y in region.exterior.coords:
+            coords.extend([x * scale, y * scale])
+
+        self.preview_canvas.config(background=self.bg_color_var.get())
+        self.preview_canvas.delete("all")
+        self.preview_canvas.create_polygon(coords, outline="#888888", fill="", width=2, dash=(5, 3))
+        self.status_var.set("Ready.")
+        self.info_var.set(f"Shape preview: {shape}. Click Generate to fill it.")
+
     def _toggle_advanced(self):
         if self.advanced_visible.get():
             self.advanced_frame.grid()
@@ -285,6 +336,7 @@ class CurveApp(tk.Tk):
                 edge=self.edge_var.get(),
                 seed=self.seed_var.get(),
                 attempts=self.attempts_var.get(),
+                fill_shape=self.fill_shape_var.get(),
             )
         except tk.TclError:
             messagebox.showerror("Invalid input", "One of the fields isn't a valid number.")
@@ -384,7 +436,8 @@ class CurveApp(tk.Tk):
         json_path.write_text(json.dumps(report, indent=2))
 
         self.info_var.set(
-            f"seed={report['seed']}  min gap={report['minimum_nonlocal_ink_gap_px']}px  "
+            f"seed={report['seed']}  shape={report.get('fill_shape', 'square')}  "
+            f"min gap={report['minimum_nonlocal_ink_gap_px']}px  "
             f"coverage={report['covered_fraction']*100:.0f}%  saved to outputs/{PREVIEW_BASENAME}.png"
         )
 
