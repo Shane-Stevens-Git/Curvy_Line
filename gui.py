@@ -64,7 +64,8 @@ from organic_curve import (generate, render_png, render_svg, GenerationError,
 from wallpaper_engine import (load_config as load_wallpaper_config,
                                save_config as save_wallpaper_config,
                                DEFAULT_PRESETS as WALLPAPER_DEFAULT_PRESETS,
-                               CACHE_DIR as WALLPAPER_CACHE_DIR)
+                               CACHE_DIR as WALLPAPER_CACHE_DIR,
+                               REGEN_REQUEST_PATH as WALLPAPER_REGEN_REQUEST_PATH)
 
 OUTPUT_DIR = Path(__file__).parent / "outputs"
 WALLPAPER_ENGINE_PATH = Path(__file__).parent / "wallpaper_engine.py"
@@ -1411,8 +1412,10 @@ class CurveApp(tk.Tk):
         rrow += 1
         ttk.Label(pad, text="Don't like the curve today's preset came out with? This\n"
                             "clears it and generates a fresh random one in its place --\n"
-                            "same preset, same day in the rotation, just a new seed.\n"
-                            "Restarts the wallpaper if it's currently running.",
+                            "same preset, same day in the rotation, just a new seed. If\n"
+                            "the wallpaper is running, today's curve keeps showing (with\n"
+                            "a small \"Generating a new curve...\" note) until the new one\n"
+                            "is ready, then it swaps in on its own -- no restart needed.",
                   foreground="#666").grid(row=rrow, column=0, columnspan=3, sticky="w", pady=(2, 4))
         rrow += 1
 
@@ -1630,10 +1633,20 @@ class CurveApp(tk.Tk):
         schedule (rotation_index/last_update in the config are untouched),
         so it stays on today's preset rather than advancing to tomorrow's.
 
-        If a wallpaper process started from this session is currently
-        running, it's stopped and restarted so the new curve shows up
-        right away -- otherwise the cleared cache just means the next
-        Start Wallpaper Now generates fresh instead of reusing today's."""
+        This does NOT try to stop/start a wallpaper process itself --
+        self._wallpaper_proc only tracks a process this gui.py session
+        started, so it has no idea whether one is actually running if it
+        was launched earlier (a real, previously-hit bug: the button would
+        tell the user to start it manually even while it was already
+        running). Instead it just touches REGEN_REQUEST_PATH, a small
+        signal file that ANY running wallpaper_engine.py instance polls
+        for once per tick, the same cheap way it already polls for the
+        midnight day-rollover. Whichever engine is actually running picks
+        it up on its own within a fraction of a second, regenerates in the
+        background while the current curve keeps crawling on screen (with
+        a small "Generating a new curve..." note), and swaps the new one
+        in automatically the moment it's ready -- no restart, no close and
+        reopen, nothing else for the user to do."""
         today = date.today().isoformat()
         cleared = 0
         if WALLPAPER_CACHE_DIR.exists():
@@ -1644,28 +1657,24 @@ class CurveApp(tk.Tk):
                 except OSError:
                     pass
 
-        running = self._wallpaper_proc is not None and self._wallpaper_proc.poll() is None
-        if running:
-            self._wp_stop()
-            self._wp_start()
-            messagebox.showinfo(
-                "New curve requested",
-                "Cleared today's cached curve and restarted the wallpaper -- "
-                "it'll be generating a fresh random one within a few seconds.",
-                parent=self._wallpaper_dialog)
-        elif cleared:
-            messagebox.showinfo(
-                "New curve requested",
-                "Cleared today's cached curve. The next time you start the "
-                "wallpaper, it'll generate a fresh random one instead of "
-                "reusing today's.",
-                parent=self._wallpaper_dialog)
-        else:
-            messagebox.showinfo(
-                "Nothing cached yet",
-                "There's no cached curve for today yet, so starting the "
-                "wallpaper will already generate a fresh random one.",
-                parent=self._wallpaper_dialog)
+        try:
+            WALLPAPER_REGEN_REQUEST_PATH.write_text(date.today().isoformat())
+        except OSError as e:
+            messagebox.showerror(
+                "Could not request a new curve", str(e), parent=self._wallpaper_dialog)
+            return
+
+        messagebox.showinfo(
+            "New curve requested",
+            "Cleared today's cached curve and asked the wallpaper for a "
+            "fresh random one.\n\n"
+            "If the wallpaper is currently running (from this app or an "
+            "earlier session), today's curve will keep showing as usual "
+            "with a small \"Generating a new curve...\" note until the new "
+            "one is ready -- it'll then swap in on its own, no restart "
+            "needed. If it isn't running, the next time you start it, "
+            "it'll generate fresh instead of reusing today's.",
+            parent=self._wallpaper_dialog)
 
 
 if __name__ == "__main__":

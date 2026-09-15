@@ -114,6 +114,17 @@ CACHE_DIR = BASE_DIR / "wallpaper_cache"
 LOCK_PATH = BASE_DIR / "wallpaper.lock"
 DEBUG_LOG_PATH = BASE_DIR / "wallpaper_debug.log"
 
+# gui.py's "New random curve for today" button doesn't manage the running
+# engine process at all (it may not even know one is running -- it could
+# have been started in an earlier app session). Instead it just clears
+# today's cache and touches this file; whichever wallpaper_engine.py
+# instance is actually running notices it on the next tick (same cheap
+# every-frame check already used for the day-rollover), consumes it, and
+# regenerates in place -- no restart, no close/reopen, and the old curve
+# keeps crawling on screen the whole time, exactly like an ordinary
+# midnight rollover.
+REGEN_REQUEST_PATH = BASE_DIR / "wallpaper_regen.request"
+
 # Set True only while actively chasing the "clicks blocked on the GUI's
 # monitor" bug -- writes timestamped diagnostics (monitor geometry, window
 # handles/rects before and after the WorkerW reparent, whether SetParent
@@ -750,6 +761,15 @@ class WallpaperWindow:
         self.path = None
         self.display_scale = 1.0
         self.preset = current_preset(self.cfg)
+        self._loading_message = None
+        # Clear out any stale regen request left over from a previous run
+        # (e.g. the engine crashed or was killed between the file being
+        # written and being consumed) so it doesn't trigger an unwanted
+        # regeneration the instant this new run starts up.
+        try:
+            REGEN_REQUEST_PATH.unlink()
+        except OSError:
+            pass
 
         self.root = tk.Tk()
         # Hide immediately, before this window is ever mapped to the screen
@@ -883,6 +903,7 @@ class WallpaperWindow:
         except queue.Empty:
             return
         self._generating = False
+        self._loading_message = None
         if result[0] == "error":
             print(f"Wallpaper curve generation failed, will retry next tick: {result[1]}")
             return
@@ -902,6 +923,19 @@ class WallpaperWindow:
         # compare) so the engine never needs restarting at midnight --
         # _start_generation() itself is a no-op while one is in flight.
         if _is_new_day(self.cfg):
+            self._start_generation()
+        elif REGEN_REQUEST_PATH.exists():
+            # gui.py's "New random curve for today" button already cleared
+            # today's cache before touching this file, so the regeneration
+            # below is guaranteed to pick a fresh random seed instead of
+            # reloading what was cached -- and since is_new_day is False
+            # here, it stays on today's preset/rotation_index rather than
+            # advancing to tomorrow's.
+            try:
+                REGEN_REQUEST_PATH.unlink()
+            except OSError:
+                pass
+            self._loading_message = "Generating a new curve..."
             self._start_generation()
 
         now = time.time()
@@ -928,6 +962,19 @@ class WallpaperWindow:
         # else: first curve is still generating in the background -- leave
         # the plain background color showing instead of erroring, since
         # there's nothing to draw yet.
+
+        if self._loading_message:
+            # Only shown for an explicit user-requested regen (see tick()
+            # above) -- not on ordinary silent daily rollover, so the
+            # wallpaper doesn't pop up unprompted text every night. Drawn
+            # on top of the still-crawling old curve, bottom-right corner
+            # so it doesn't sit under any desktop icons up top.
+            margin = max(16, int(24 * self.display_scale))
+            self.canvas.create_text(
+                self.w - margin, self.h - margin,
+                text=self._loading_message, fill="#ffffff",
+                font=("Segoe UI", max(10, int(14 * self.display_scale))),
+                anchor="se")
 
         self.root.after(FRAME_MS, self.tick)
 
