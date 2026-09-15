@@ -51,6 +51,7 @@ import sys
 import threading
 import time
 import tkinter as tk
+from datetime import date
 from pathlib import Path
 from tkinter import colorchooser, ttk, filedialog, messagebox
 
@@ -62,7 +63,8 @@ from organic_curve import (generate, render_png, render_svg, GenerationError,
                             build_gradient_palette)
 from wallpaper_engine import (load_config as load_wallpaper_config,
                                save_config as save_wallpaper_config,
-                               DEFAULT_PRESETS as WALLPAPER_DEFAULT_PRESETS)
+                               DEFAULT_PRESETS as WALLPAPER_DEFAULT_PRESETS,
+                               CACHE_DIR as WALLPAPER_CACHE_DIR)
 
 OUTPUT_DIR = Path(__file__).parent / "outputs"
 WALLPAPER_ENGINE_PATH = Path(__file__).parent / "wallpaper_engine.py"
@@ -1403,6 +1405,17 @@ class CurveApp(tk.Tk):
                   foreground="#666").grid(row=rrow, column=0, columnspan=3, sticky="w", pady=(4, 0))
         rrow += 1
 
+        ttk.Button(pad, text="New random curve for today",
+                   command=self._wp_new_curve_for_today).grid(
+            row=rrow, column=0, columnspan=3, sticky="ew", pady=(10, 0))
+        rrow += 1
+        ttk.Label(pad, text="Don't like the curve today's preset came out with? This\n"
+                            "clears it and generates a fresh random one in its place --\n"
+                            "same preset, same day in the rotation, just a new seed.\n"
+                            "Restarts the wallpaper if it's currently running.",
+                  foreground="#666").grid(row=rrow, column=0, columnspan=3, sticky="w", pady=(2, 4))
+        rrow += 1
+
         bottom_row = ttk.Frame(pad)
         bottom_row.grid(row=rrow, column=0, columnspan=3, sticky="ew", pady=(14, 0))
         ttk.Button(bottom_row, text="Save", command=self._wp_save).pack(side="left", fill="x", expand=True)
@@ -1607,6 +1620,52 @@ class CurveApp(tk.Tk):
         if self._wallpaper_dialog is not None and self._wallpaper_dialog.winfo_exists():
             self._wp_start_btn.config(state="disabled" if running else "normal")
             self._wp_stop_btn.config(state="normal" if running else "disabled")
+
+    def _wp_new_curve_for_today(self):
+        """wallpaper_engine.py caches one generated curve per (day, preset,
+        resolution) so it doesn't regenerate on every restart -- see
+        load_or_generate_path(). Deleting today's cached .npy file(s) is
+        all it takes to make the next generation pick a fresh random seed
+        instead of reusing what's cached; this doesn't touch the rotation
+        schedule (rotation_index/last_update in the config are untouched),
+        so it stays on today's preset rather than advancing to tomorrow's.
+
+        If a wallpaper process started from this session is currently
+        running, it's stopped and restarted so the new curve shows up
+        right away -- otherwise the cleared cache just means the next
+        Start Wallpaper Now generates fresh instead of reusing today's."""
+        today = date.today().isoformat()
+        cleared = 0
+        if WALLPAPER_CACHE_DIR.exists():
+            for f in WALLPAPER_CACHE_DIR.glob(f"{today}_*.npy"):
+                try:
+                    f.unlink()
+                    cleared += 1
+                except OSError:
+                    pass
+
+        running = self._wallpaper_proc is not None and self._wallpaper_proc.poll() is None
+        if running:
+            self._wp_stop()
+            self._wp_start()
+            messagebox.showinfo(
+                "New curve requested",
+                "Cleared today's cached curve and restarted the wallpaper -- "
+                "it'll be generating a fresh random one within a few seconds.",
+                parent=self._wallpaper_dialog)
+        elif cleared:
+            messagebox.showinfo(
+                "New curve requested",
+                "Cleared today's cached curve. The next time you start the "
+                "wallpaper, it'll generate a fresh random one instead of "
+                "reusing today's.",
+                parent=self._wallpaper_dialog)
+        else:
+            messagebox.showinfo(
+                "Nothing cached yet",
+                "There's no cached curve for today yet, so starting the "
+                "wallpaper will already generate a fresh random one.",
+                parent=self._wallpaper_dialog)
 
 
 if __name__ == "__main__":
