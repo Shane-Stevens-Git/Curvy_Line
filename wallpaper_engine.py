@@ -381,18 +381,32 @@ class WallpaperWindow:
 
         self.root.after(FRAME_MS, self.tick)
 
-    def run(self):
+    def run(self, test_seconds=None):
         self.tick()
+        if test_seconds:
+            # Verification-only: auto-close after N seconds instead of
+            # running forever, so a live test can be launched and checked
+            # (e.g. by double-clicking a .bat) without needing to type into
+            # or otherwise control the window to end it.
+            self.root.after(int(test_seconds * 1000), self.root.destroy)
         self.root.mainloop()
 
 
 def main():
+    test_seconds = None
+    for i, arg in enumerate(sys.argv):
+        if arg == "--test-seconds" and i + 1 < len(sys.argv):
+            try:
+                test_seconds = float(sys.argv[i + 1])
+            except ValueError:
+                pass
+
     if sys.platform != "win32":
         print("wallpaper_engine.py's desktop-icon reparenting only works on "
               "Windows. Running anyway in a normal (non-wallpaper) window, "
               "which is fine for testing the animation and rotation logic.")
     window = WallpaperWindow()
-    window.run()
+    window.run(test_seconds=test_seconds)
 
 
 if __name__ == "__main__":
