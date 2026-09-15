@@ -234,7 +234,11 @@ class CurveApp(tk.Tk):
             row=row, column=0, columnspan=2, sticky="w", pady=(4, 12))
         row += 1
 
-        # --- Save / cleanup ---
+        # --- Replay / Save / cleanup ---
+        self.replay_btn = ttk.Button(parent, text="Replay animation", command=self._replay_animation,
+                                      state="disabled")
+        self.replay_btn.grid(row=row, column=0, columnspan=2, sticky="ew", pady=(8, 4))
+        row += 1
         self.save_btn = ttk.Button(parent, text="Save As...", command=self._save_as, state="disabled")
         self.save_btn.grid(row=row, column=0, columnspan=2, sticky="ew", pady=(8, 4))
         row += 1
@@ -291,6 +295,7 @@ class CurveApp(tk.Tk):
         self._anim_skip = False
         self.generate_btn.config(state="disabled")
         self.save_btn.config(state="disabled")
+        self.replay_btn.config(state="disabled")
         self.skip_btn.config(state="disabled")
         self.progress.config(value=0)
         self.status_var.set("Starting...")
@@ -340,6 +345,9 @@ class CurveApp(tk.Tk):
                 elif kind == "rerendered":
                     _, img, svg_text = msg
                     self._on_rerendered(img, svg_text)
+                elif kind == "replay_ready":
+                    _, token, p, size, stroke, img = msg
+                    self._on_replay_ready(token, p, size, stroke, img)
         except queue.Empty:
             pass
         self.after(100, self._poll_queue)
@@ -348,6 +356,7 @@ class CurveApp(tk.Tk):
         self.busy = False
         self.generate_btn.config(state="normal")
         self.save_btn.config(state="normal")
+        self.replay_btn.config(state="normal")
         self.progress.config(value=100)
         self.status_var.set(f"Done in {elapsed:.1f}s (seed {report['seed']}).")
 
@@ -410,16 +419,19 @@ class CurveApp(tk.Tk):
         points_per_frame = max(1, n_points // n_frames)
 
         self.skip_btn.config(state="normal")
+        self.replay_btn.config(state="disabled")  # avoid overlapping animations on the same canvas
 
         def step(next_point=2):
             if token != self._gen_token:
-                return  # a newer generation started; abandon this animation
+                return  # a newer generation/replay started; abandon this animation
             if self._anim_skip:
                 next_point = n_points
             end = min(n_points, next_point + points_per_frame)
             self.preview_canvas.coords(line_id, *coords[: end * 2])
             if end >= n_points:
                 self.skip_btn.config(state="disabled")
+                if not self.busy:
+                    self.replay_btn.config(state="normal")
                 self._show_preview(final_img)  # swap in the crisp anti-aliased render to finish
                 return
             self.after(frame_ms, lambda: step(end))
@@ -428,6 +440,34 @@ class CurveApp(tk.Tk):
 
     def _skip_animation(self):
         self._anim_skip = True
+
+    def _replay_animation(self):
+        """Re-play the draw-in animation for the already-generated curve,
+        using whatever colors/stroke are currently selected -- no
+        regeneration, just a fresh render + playback of the existing path."""
+        if self.last_path is None or self.busy:
+            return
+        self._gen_token += 1  # cancel any animation still running (generate or a prior replay)
+        self._anim_skip = False
+        token = self._gen_token
+        self.replay_btn.config(state="disabled")
+
+        p = self.last_path
+        size = self.last_size
+        stroke = self.display_stroke_var.get()
+        line_color = self.line_color_var.get()
+        bg_color = self.bg_color_var.get()
+
+        def work():
+            img = render_png(p, size, stroke, line_color=line_color, bg_color=bg_color)
+            self.worker_queue.put(("replay_ready", token, p, size, stroke, img))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_replay_ready(self, token, p, size, stroke, img):
+        if token != self._gen_token:
+            return  # superseded by a newer generate/replay while rendering
+        self._animate_draw(p, size, stroke, img)
 
     def _on_generation_error(self, message):
         self.busy = False
