@@ -584,6 +584,67 @@ def render_png(p, size, stroke, scale=4, line_color='#ffffff', bg_color='#000000
     return img.resize((w, h), Image.Resampling.LANCZOS)
 
 
+def crawl_bands(p, crawler_len, gap_len, phase=0.0, n_colors=3):
+    """Split an already-generated path into colored "crawler" runs for a
+    chasing-lights animation: n_colors repeating bands of crawler_len px
+    (measured along the path's own arc length, not straight-line distance)
+    each, separated by gap_len px of nothing (the background shows through),
+    cycling through color index 0..n_colors-1 and shifted along the path by
+    `phase` px -- animate by calling this repeatedly with an increasing
+    phase (wrapping at n_colors*(crawler_len+gap_len), the pattern's period,
+    is safe but not required; the % below handles any phase).
+
+    Returns a list of (color_index, points) -- points is a slice of `p` for
+    one continuous colored run, ready to hand to any line-drawing backend.
+    Gaps aren't included (nothing is drawn there).
+
+    Pure function of the path and pattern parameters only -- no rendering,
+    no Tkinter, no file I/O -- so a live GUI preview, a static frame export
+    (render_crawl_frame below), and a future live-wallpaper daemon can all
+    drive the exact same animation logic and always match each other frame
+    for frame.
+    """
+    if crawler_len <= 0 or gap_len < 0:
+        raise GenerationError('crawler_len must be > 0 and gap_len must be >= 0.')
+    if n_colors < 1:
+        raise GenerationError('n_colors must be >= 1.')
+    arc = np.r_[0, np.cumsum(np.linalg.norm(np.diff(p, axis=0), axis=1))]
+    cycle = crawler_len + gap_len
+    period = n_colors * cycle
+    pos = (arc + phase) % period
+    cycle_pos = pos % cycle
+    # -1 marks a gap point (nothing drawn there); otherwise the color index.
+    band = np.where(cycle_pos < crawler_len, (pos // cycle).astype(int) % n_colors, -1)
+    boundaries = np.flatnonzero(np.diff(band) != 0) + 1
+    starts = np.r_[0, boundaries]
+    ends = np.r_[boundaries, len(band)]
+    return [(int(band[s]), p[s:e]) for s, e in zip(starts, ends) if band[s] != -1 and e - s >= 2]
+
+
+def render_crawl_frame(p, size, stroke, colors, crawler_len, gap_len, phase=0.0,
+                        bg_color='#000000', scale=4):
+    """Render one frame of the crawl animation as a PIL Image. Pure
+    function: no file I/O, no Tkinter. `colors` is a list of hex strings
+    (any length -- the GUI's crawl control uses 3); each drawn run gets
+    rounded end caps, matching render_png's look for a single continuous
+    line. Calling this repeatedly with an advancing `phase` produces the
+    animation's frames -- meant to be reusable well beyond the GUI's own
+    live preview: a GIF exporter or a future live-wallpaper daemon can call
+    it exactly the same way, on a timer, with no Tkinter dependency at all.
+    """
+    width, height = _wh(size)
+    w, h = round(width), round(height)
+    img = Image.new('RGB', (w*scale, h*scale), bg_color)
+    draw = ImageDraw.Draw(img)
+    for color_idx, pts in crawl_bands(p, crawler_len, gap_len, phase, n_colors=len(colors)):
+        color = colors[color_idx]
+        draw.line([tuple(q*scale) for q in pts], fill=color, width=round(stroke*scale), joint='curve')
+        r = stroke * scale / 2
+        for x, y in (pts[0]*scale, pts[-1]*scale):
+            draw.ellipse((x-r, y-r, x+r, y+r), fill=color)
+    return img.resize((w, h), Image.Resampling.LANCZOS)
+
+
 def _fmt_dim(n):
     """Format a canvas dimension for SVG markup: no trailing '.0' for a
     whole-pixel value (matches the original viewBox="0 0 {size} {size}"

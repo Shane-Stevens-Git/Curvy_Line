@@ -19,6 +19,13 @@ static image; "Skip" jumps straight to the finished frame. The animation is
 just a progressive reveal of the already-computed path for playback -- it
 does not change what gets generated, saved, or validated.
 
+"Color crawl" is a separate, looping animation: 3 colors chase along the
+already-generated curve in repeating bands, like chasing lights. Crawler
+size/gap/speed and the 3 colors all update live while it's running. The
+banding math (organic_curve.crawl_bands) is a plain function of the path,
+not tied to Tkinter, so the same logic can drive a static frame exporter or
+a future live-wallpaper daemon later -- this GUI is just one consumer of it.
+
 Line color, background color, and "Display stroke" (after a generation) are
 pure presentation -- they redraw the already-computed, already-validated
 path instantly instead of re-running the ~seconds-to-a-minute generation.
@@ -49,7 +56,7 @@ from PIL import ImageTk
 from shapely.geometry import Polygon as ShapelyPolygon
 
 from organic_curve import (generate, render_png, render_svg, GenerationError,
-                            max_safe_render_stroke, fill_polygon, FILL_SHAPES)
+                            max_safe_render_stroke, fill_polygon, FILL_SHAPES, crawl_bands)
 
 OUTPUT_DIR = Path(__file__).parent / "outputs"
 PREVIEW_BASENAME = "preview"
@@ -79,6 +86,13 @@ class CurveApp(tk.Tk):
         self.custom_points = []     # raw (canvas_x, canvas_y) points while a stroke is in progress
         self._draw_mode = False     # armed: next drag on the preview canvas draws a boundary
         self._drawing = False       # a drag is currently in progress
+
+        # Color crawl animation state (see crawl_bands()).
+        self._crawl_running = False
+        self._crawl_token = 0    # invalidates a stale/superseded crawl loop
+        self._crawl_phase = 0.0  # px along the path the pattern has shifted so far
+        self._crawl_last_tick = 0.0
+        self._last_static_img = None  # the most recent crisp (non-animating) render, to restore on Stop
 
         OUTPUT_DIR.mkdir(exist_ok=True)
 
@@ -236,6 +250,36 @@ class CurveApp(tk.Tk):
                   foreground="#666").grid(row=row, column=0, columnspan=2, sticky="w", pady=(2, 0))
         row += 1
 
+        # --- Color crawl (looping chasing-lights animation, pure presentation) ---
+        ttk.Label(parent, text="Color crawl", font=("", 10, "bold")).grid(
+            row=row, column=0, columnspan=2, sticky="w", pady=(14, 2))
+        row += 1
+
+        crawl_color_row = ttk.Frame(parent)
+        crawl_color_row.grid(row=row, column=0, columnspan=2, sticky="ew")
+        row += 1
+        self.crawl_color_vars = [tk.StringVar(value=c) for c in ("#ff595e", "#8ac926", "#1982c4")]
+        for i, cvar in enumerate(self.crawl_color_vars):
+            btn = tk.Button(crawl_color_row, text=f"Crawler {i + 1}", width=9,
+                             background=cvar.get(), activebackground=cvar.get(),
+                             foreground=self._contrast_text_color(cvar.get()))
+            btn.config(command=lambda v=cvar, b=btn, n=i + 1: self._pick_crawl_color(v, b, f"Crawler {n} color"))
+            btn.pack(side="left", padx=(0 if i == 0 else 4, 0))
+
+        self.crawler_size_var = tk.DoubleVar(value=40.0)
+        add_slider("Crawler size (px)", self.crawler_size_var, 4.0, 300.0, 2.0, "{:.0f}")
+        self.crawl_gap_var = tk.DoubleVar(value=20.0)
+        add_slider("Gap between crawlers (px)", self.crawl_gap_var, 0.0, 300.0, 2.0, "{:.0f}")
+        self.crawl_speed_var = tk.DoubleVar(value=300.0)
+        add_slider("Crawl speed (px/s)", self.crawl_speed_var, 10.0, 2000.0, 10.0, "{:.0f}")
+
+        self.crawl_btn = ttk.Button(parent, text="Start crawl", command=self._toggle_crawl, state="disabled")
+        self.crawl_btn.grid(row=row, column=0, columnspan=2, sticky="ew", pady=(4, 4))
+        row += 1
+        ttk.Label(parent, text="Generate once to unlock. Colors/sliders\nupdate live while it's running.",
+                  foreground="#666").grid(row=row, column=0, columnspan=2, sticky="w", pady=(0, 4))
+        row += 1
+
         # --- Advanced (collapsible) ---
         self.advanced_visible = tk.BooleanVar(value=False)
         toggle = ttk.Checkbutton(parent, text="Advanced settings", variable=self.advanced_visible,
@@ -363,6 +407,8 @@ class CurveApp(tk.Tk):
         except tk.TclError:
             return  # mid-edit -- leave the canvas as-is
 
+        self._stop_crawl(restore=False)  # about to redraw the canvas ourselves
+
         if shape == "custom":
             if self.custom_region is not None:
                 self._redraw_custom_boundary_outline()
@@ -386,6 +432,7 @@ class CurveApp(tk.Tk):
         self.last_report = None
         self.save_btn.config(state="disabled")
         self.replay_btn.config(state="disabled")
+        self.crawl_btn.config(state="disabled")
         self.display_stroke_scale.config(state="disabled")
         self.display_stroke_label.config(text="--")
 
@@ -446,6 +493,7 @@ class CurveApp(tk.Tk):
     def _toggle_draw_mode(self):
         if self.busy:
             return
+        self._stop_crawl(restore=False)  # about to take over the canvas either way
         if self._draw_mode:
             self._draw_mode = False
             self._drawing = False
@@ -527,6 +575,7 @@ class CurveApp(tk.Tk):
         self._redraw_custom_boundary_outline()
 
     def _redraw_custom_boundary_outline(self):
+        self._stop_crawl(restore=False)  # about to redraw the canvas ourselves
         width, height = self.width_var.get(), self.height_var.get()
         scale, off_x, off_y = self._preview_scale_offset(width, height)
         coords = []
@@ -537,6 +586,7 @@ class CurveApp(tk.Tk):
         self.last_report = None
         self.save_btn.config(state="disabled")
         self.replay_btn.config(state="disabled")
+        self.crawl_btn.config(state="disabled")
         self.display_stroke_scale.config(state="disabled")
         self.display_stroke_label.config(text="--")
 
@@ -598,12 +648,14 @@ class CurveApp(tk.Tk):
             messagebox.showerror("Invalid input", "One of the fields isn't a valid number.")
             return
 
+        self._stop_crawl(restore=False)  # about to overwrite the canvas with a new run anyway
         self.busy = True
         self._gen_token += 1  # invalidate any still-running animation from a previous generate
         self._anim_skip = False
         self.generate_btn.config(state="disabled")
         self.save_btn.config(state="disabled")
         self.replay_btn.config(state="disabled")
+        self.crawl_btn.config(state="disabled")
         self.skip_btn.config(state="disabled")
         self.progress.config(value=0)
         self.status_var.set("Starting...")
@@ -665,6 +717,7 @@ class CurveApp(tk.Tk):
         self.generate_btn.config(state="normal")
         self.save_btn.config(state="normal")
         self.replay_btn.config(state="normal")
+        self.crawl_btn.config(state="normal")
         self.progress.config(value=100)
         self.status_var.set(f"Done in {elapsed:.1f}s (seed {report['seed']}).")
 
@@ -673,6 +726,7 @@ class CurveApp(tk.Tk):
         self.last_size = params["size"]
         self.last_stroke = params["stroke"]
         self.last_generation_stroke = params["stroke"]
+        self._last_static_img = img
 
         # Unlock "Display stroke": bounded so it can thin freely but can only
         # thicken up to the point the validated minimum gap would hit zero.
@@ -761,6 +815,7 @@ class CurveApp(tk.Tk):
         regeneration, just a fresh render + playback of the existing path."""
         if self.last_path is None or self.busy:
             return
+        self._stop_crawl(restore=False)  # about to take over the canvas anyway
         self._gen_token += 1  # cancel any animation still running (generate or a prior replay)
         self._anim_skip = False
         token = self._gen_token
@@ -781,7 +836,92 @@ class CurveApp(tk.Tk):
     def _on_replay_ready(self, token, p, size, stroke, img):
         if token != self._gen_token:
             return  # superseded by a newer generate/replay while rendering
+        self._last_static_img = img
         self._animate_draw(p, size, stroke, img)
+
+    # ------------------------------------------------------- color crawl ----
+
+    def _pick_crawl_color(self, var, swatch_btn, title):
+        _rgb, hexval = colorchooser.askcolor(color=var.get(), title=title)
+        if not hexval:
+            return  # user cancelled
+        var.set(hexval)
+        swatch_btn.config(background=hexval, activebackground=hexval,
+                           foreground=self._contrast_text_color(hexval))
+        # Nothing else to do: a running crawl reads these vars fresh every
+        # tick, and a stopped one just shows the new swatch until started.
+
+    def _toggle_crawl(self):
+        if self.last_path is None or self.busy:
+            return
+        if self._crawl_running:
+            self._stop_crawl()
+        else:
+            self._start_crawl()
+
+    def _start_crawl(self):
+        self._gen_token += 1  # cancel any draw-in animation still running on this canvas
+        self._anim_skip = False
+        self.skip_btn.config(state="disabled")
+        self._crawl_running = True
+        self._crawl_token += 1
+        self._crawl_phase = 0.0
+        self._crawl_last_tick = time.time()
+        self.crawl_btn.config(text="Stop crawl")
+        self.replay_btn.config(state="disabled")
+        self.save_btn.config(state="disabled")  # "Save As" saves the static render, not a crawl frame
+        self._crawl_tick(self._crawl_token)
+
+    def _stop_crawl(self, restore=True):
+        """Stop the crawl loop. `restore=False` skips redrawing the static
+        image, for callers that are about to draw something else on the
+        canvas themselves right after (a new generate, a shape-preview
+        redraw, starting to draw a custom boundary, etc.) -- avoids a
+        pointless flash of the old static render in between."""
+        was_running = self._crawl_running
+        self._crawl_running = False
+        self.crawl_btn.config(text="Start crawl")
+        if self.last_path is not None and not self.busy:
+            self.replay_btn.config(state="normal")
+            self.save_btn.config(state="normal")
+        if restore and was_running and self._last_static_img is not None:
+            self._show_preview(self._last_static_img)
+
+    def _crawl_tick(self, token):
+        """One frame of the chasing-lights animation: recolor the whole
+        curve as a sequence of Tkinter line segments per crawl_bands(), then
+        schedule the next frame. Crawler size/gap/speed and all 3 colors are
+        read fresh every tick, so they update live while this is running --
+        no need to stop/restart to see a change. Runs until _stop_crawl()
+        (or something else takes over the canvas and bumps the token)."""
+        if not self._crawl_running or token != self._crawl_token or self.last_path is None:
+            return
+        now = time.time()
+        dt = max(0.0, min(0.25, now - self._crawl_last_tick))  # clamp a stall/lag spike
+        self._crawl_last_tick = now
+        try:
+            speed = max(0.0, self.crawl_speed_var.get())
+            crawler_len = max(1.0, self.crawler_size_var.get())
+            gap_len = max(0.0, self.crawl_gap_var.get())
+        except tk.TclError:
+            speed, crawler_len, gap_len = 300.0, 40.0, 20.0
+        period = 3 * (crawler_len + gap_len)
+        self._crawl_phase = (self._crawl_phase + speed * dt) % period
+
+        width, height = self.last_size
+        scale, off_x, off_y = self._preview_scale_offset(width, height)
+        colors = [v.get() for v in self.crawl_color_vars]
+        stroke = self.display_stroke_var.get()
+
+        self.preview_canvas.config(background=self.bg_color_var.get())
+        self.preview_canvas.delete("all")
+        for color_idx, pts in crawl_bands(self.last_path, crawler_len, gap_len, self._crawl_phase, n_colors=3):
+            coords = ((pts * scale) + [off_x, off_y]).flatten().tolist()
+            self.preview_canvas.create_line(*coords, fill=colors[color_idx],
+                                             width=max(1.0, stroke * scale),
+                                             capstyle=tk.ROUND, joinstyle=tk.ROUND)
+
+        self.after(30, lambda: self._crawl_tick(token))
 
     def _on_generation_error(self, message):
         self.busy = False
@@ -834,8 +974,10 @@ class CurveApp(tk.Tk):
         choices. Pure presentation: does not touch the underlying geometry,
         so this is a fast re-render, not a regenerate, and is safe to fire
         from a color pick or a stroke-slider release even while nothing new
-        is being generated."""
-        if self.last_path is None or self.busy or self._rerendering:
+        is being generated. Skipped while the crawl animation is running --
+        it already redraws every tick and reads bg_color live on its own, so
+        there's nothing for this to usefully update."""
+        if self.last_path is None or self.busy or self._rerendering or self._crawl_running:
             return
         self._rerendering = True
         p = self.last_path
@@ -860,6 +1002,7 @@ class CurveApp(tk.Tk):
         img.save(png_path)
         svg_path.write_text(svg_text)
 
+        self._last_static_img = img
         self._show_preview(img)
         gen_stroke = self.last_generation_stroke
         disp_stroke = self.last_stroke
