@@ -122,6 +122,23 @@ DEBUG_LOG_PATH = BASE_DIR / "wallpaper_debug.log"
 # gitignored, but there's no reason to leave it on once this is resolved.
 DEBUG_LOGGING = True
 
+# Temporary diagnostic switch: set False to skip the WorkerW "behind the
+# desktop icons" reparenting trick entirely and always use the plain
+# positioned/lowered/click-through window instead. This isolates whether
+# the cross-process SetParent() attachment itself (not anything about our
+# window's own styles, which have already been verified applied and
+# ineffective at fixing the click-blocking bug) is the actual cause --
+# wallpaper_debug.log has shown reparenting succeeding at the correct
+# monitor/position, with WS_EX_NOACTIVATE + WS_EX_TRANSPARENT confirmed
+# applied, and the exact same "GUI's monitor stops accepting clicks"
+# symptom still happening regardless. If turning this off fixes it, the
+# WorkerW attachment itself (an unusual, poorly-documented cross-process
+# operation) is the culprit, and it should stay off permanently -- the
+# wallpaper would then render as a normal (not literally behind-icons,
+# but click-safe) window instead. Flip back to True to retry reparenting
+# once/if that's better understood.
+ATTEMPT_WORKERW_REPARENT = False
+
 _debug_log_started = False
 
 
@@ -789,12 +806,22 @@ class WallpaperWindow:
         _make_input_safe(root_hwnd)
 
         target_rect = (self.x, self.y, self.x + self.w, self.y + self.h)
-        reparented = reparent_behind_desktop_icons(root_hwnd, target_rect=target_rect)
+        if ATTEMPT_WORKERW_REPARENT:
+            reparented = reparent_behind_desktop_icons(root_hwnd, target_rect=target_rect)
+        else:
+            _debug_log("ATTEMPT_WORKERW_REPARENT is False -- skipping the WorkerW trick "
+                       "entirely this run (diagnostic build) and going straight to the "
+                       "plain positioned/lowered/click-through window below.")
+            reparented = False
         if not reparented:
-            print("Could not attach behind the desktop icons "
-                  "(WorkerW trick did not find its target) -- "
-                  "falling back to a normal window instead.")
-            _debug_log("reparenting FAILED -- falling back to a normal top-level window. "
+            if ATTEMPT_WORKERW_REPARENT:
+                print("Could not attach behind the desktop icons "
+                      "(WorkerW trick did not find its target) -- "
+                      "falling back to a normal window instead.")
+            else:
+                print("Skipping the WorkerW desktop-icons trick (diagnostic build) -- "
+                      "using a normal window instead.")
+            _debug_log("reparenting not in effect -- falling back to a normal top-level window. "
                        "Lowering it in the normal z-order as a safety net so it can't "
                        "sit on top of (and block clicks to) other apps like gui.py.")
             # Reparenting failed, so this stayed a normal top-level window
