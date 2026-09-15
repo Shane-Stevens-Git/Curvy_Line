@@ -621,6 +621,55 @@ def crawl_bands(p, crawler_len, gap_len, phase=0.0, n_colors=3):
     return [(int(band[s]), p[s:e]) for s, e in zip(starts, ends) if band[s] != -1 and e - s >= 2]
 
 
+def _hex_to_rgb(hex_color):
+    h = hex_color.lstrip('#')
+    return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def _rgb_to_hex(rgb):
+    r, g, b = (max(0, min(255, round(c))) for c in rgb)
+    return f'#{r:02x}{g:02x}{b:02x}'
+
+
+def build_gradient_palette(colors, steps=8):
+    """Expand a cyclic list of hex colors into a longer cyclic list of hex
+    colors, with `steps` smoothly interpolated shades between each
+    consecutive pair (wrapping from the last color back to the first).
+
+    This is meant to be handed straight to crawl_bands() in place of the
+    original `colors`, with n_colors=len(palette): crawl_bands()'s band
+    (dash) count and spacing are governed only by crawler_len/gap_len, not
+    by n_colors, so expanding the palette this way is free -- the exact
+    same number of dashes get drawn either way, each one just looks up a
+    color from a richer list instead of one of a few flat colors. With
+    consecutive dashes only a shade apart, the chasing-lights animation
+    reads as a smooth color blend instead of cutting sharply between
+    colors.
+
+    steps=1 (or fewer than 2 colors) returns the original colors
+    unchanged -- the old hard-cut look.
+
+    Pure function: no Tkinter, no file I/O. Shared by gui.py's live
+    preview and wallpaper_engine.py's wallpaper rendering so both always
+    produce the exact same blend.
+    """
+    if not colors:
+        raise GenerationError('colors must be a non-empty list.')
+    if steps < 1:
+        raise GenerationError('steps must be >= 1.')
+    if len(colors) < 2 or steps == 1:
+        return list(colors)
+    rgb = [_hex_to_rgb(c) for c in colors]
+    n = len(rgb)
+    palette = []
+    for i in range(n):
+        a, b = rgb[i], rgb[(i + 1) % n]
+        for s in range(steps):
+            t = s / steps
+            palette.append(_rgb_to_hex(tuple(a[k] + (b[k] - a[k]) * t for k in range(3))))
+    return palette
+
+
 def render_crawl_frame(p, size, stroke, colors, crawler_len, gap_len, phase=0.0,
                         bg_color='#000000', scale=4):
     """Render one frame of the crawl animation as a PIL Image. Pure

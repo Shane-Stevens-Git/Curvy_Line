@@ -106,7 +106,7 @@ from pathlib import Path
 
 import numpy as np
 
-from organic_curve import generate, crawl_bands, GenerationError, FILL_SHAPES
+from organic_curve import generate, crawl_bands, build_gradient_palette, GenerationError, FILL_SHAPES
 
 BASE_DIR = Path(__file__).parent
 CONFIG_PATH = BASE_DIR / "wallpaper_config.json"
@@ -182,6 +182,7 @@ DEFAULT_PRESETS = [
         "crawler_size": 60.0,
         "gap": 30.0,
         "speed": 220.0,
+        "blend_steps": 8.0,
     },
     {
         "fill_shape": "square",
@@ -189,6 +190,7 @@ DEFAULT_PRESETS = [
         "crawler_size": 45.0,
         "gap": 22.0,
         "speed": 260.0,
+        "blend_steps": 8.0,
     },
     {
         "fill_shape": "square",
@@ -196,6 +198,7 @@ DEFAULT_PRESETS = [
         "crawler_size": 70.0,
         "gap": 35.0,
         "speed": 180.0,
+        "blend_steps": 8.0,
     },
 ]
 
@@ -911,13 +914,15 @@ class WallpaperWindow:
             gap_len = max(0.0, float(self.preset.get("gap", 20.0)))
             speed = max(0.0, float(self.preset.get("speed", 200.0)))
             colors = self.preset.get("colors", DEFAULT_PRESETS[0]["colors"])
-            period = len(colors) * (crawler_len + gap_len)
+            blend_steps = max(1, int(self.preset.get("blend_steps", 8.0)))
+            palette = build_gradient_palette(colors, steps=blend_steps)
+            period = len(palette) * (crawler_len + gap_len)
             self._phase = (self._phase + speed * dt) % period if period > 0 else 0.0
 
             stroke = self.cfg.get("stroke", 6.0) * self.display_scale
-            for color_idx, pts in crawl_bands(self.path, crawler_len, gap_len, self._phase, n_colors=len(colors)):
+            for color_idx, pts in crawl_bands(self.path, crawler_len, gap_len, self._phase, n_colors=len(palette)):
                 coords = (pts * self.display_scale).flatten().tolist()
-                self.canvas.create_line(*coords, fill=colors[color_idx],
+                self.canvas.create_line(*coords, fill=palette[color_idx],
                                          width=max(1.0, stroke),
                                          capstyle=tk.ROUND, joinstyle=tk.ROUND)
         # else: first curve is still generating in the background -- leave

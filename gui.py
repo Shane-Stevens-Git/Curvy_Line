@@ -58,7 +58,8 @@ from PIL import ImageTk
 from shapely.geometry import Polygon as ShapelyPolygon
 
 from organic_curve import (generate, render_png, render_svg, GenerationError,
-                            max_safe_render_stroke, fill_polygon, FILL_SHAPES, crawl_bands)
+                            max_safe_render_stroke, fill_polygon, FILL_SHAPES, crawl_bands,
+                            build_gradient_palette)
 from wallpaper_engine import (load_config as load_wallpaper_config,
                                save_config as save_wallpaper_config,
                                DEFAULT_PRESETS as WALLPAPER_DEFAULT_PRESETS)
@@ -448,11 +449,16 @@ class CurveApp(tk.Tk):
         add_slider("Gap between crawlers (px)", self.crawl_gap_var, 0.0, 300.0, 2.0, "{:.0f}")
         self.crawl_speed_var = tk.DoubleVar(value=300.0)
         add_slider("Crawl speed (px/s)", self.crawl_speed_var, 10.0, 2000.0, 10.0, "{:.0f}")
+        self.crawl_blend_var = tk.DoubleVar(value=8.0)
+        add_slider("Blend (steps between colors)", self.crawl_blend_var, 1.0, 24.0, 1.0, "{:.0f}")
 
         self.crawl_btn = ttk.Button(parent, text="Start crawl", command=self._toggle_crawl, state="disabled")
         self.crawl_btn.grid(row=row, column=0, columnspan=2, sticky="ew", pady=(4, 4))
         row += 1
-        ttk.Label(parent, text="Generate once to unlock. Colors/sliders\nupdate live while it's running.",
+        ttk.Label(parent, text="Generate once to unlock. Colors/sliders\n"
+                               "update live while it's running. Blend=1 is\n"
+                               "the old hard cut between colors; higher\n"
+                               "values fade them into each other.",
                   foreground="#666").grid(row=row, column=0, columnspan=2, sticky="w", pady=(0, 4))
         row += 1
 
@@ -1026,21 +1032,24 @@ class CurveApp(tk.Tk):
             speed = max(0.0, self.crawl_speed_var.get())
             crawler_len = max(1.0, self.crawler_size_var.get())
             gap_len = max(0.0, self.crawl_gap_var.get())
+            blend_steps = max(1, int(self.crawl_blend_var.get()))
         except tk.TclError:
-            speed, crawler_len, gap_len = 300.0, 40.0, 20.0
-        period = 3 * (crawler_len + gap_len)
-        self._crawl_phase = (self._crawl_phase + speed * dt) % period
+            speed, crawler_len, gap_len, blend_steps = 300.0, 40.0, 20.0, 8
 
         width, height = self.last_size
         scale, off_x, off_y = self._preview_scale_offset(width, height)
         colors = [v.get() for v in self.crawl_color_vars]
+        palette = build_gradient_palette(colors, steps=blend_steps)
+        period = len(palette) * (crawler_len + gap_len)
+        self._crawl_phase = (self._crawl_phase + speed * dt) % period
         stroke = self.display_stroke_var.get()
 
         self.preview_canvas.config(background=self.bg_color_var.get())
         self.preview_canvas.delete("all")
-        for color_idx, pts in crawl_bands(self.last_path, crawler_len, gap_len, self._crawl_phase, n_colors=3):
+        for color_idx, pts in crawl_bands(self.last_path, crawler_len, gap_len, self._crawl_phase,
+                                           n_colors=len(palette)):
             coords = ((pts * scale) + [off_x, off_y]).flatten().tolist()
-            self.preview_canvas.create_line(*coords, fill=colors[color_idx],
+            self.preview_canvas.create_line(*coords, fill=palette[color_idx],
                                              width=max(1.0, stroke * scale),
                                              capstyle=tk.ROUND, joinstyle=tk.ROUND)
 
@@ -1290,12 +1299,13 @@ class CurveApp(tk.Tk):
         self._wp_size_var, self._wp_size_scale = wp_slider("Crawler size (px)", 4.0, 300.0, 2.0)
         self._wp_gap_var, self._wp_gap_scale = wp_slider("Gap between crawlers (px)", 0.0, 300.0, 2.0)
         self._wp_speed_var, self._wp_speed_scale = wp_slider("Crawl speed (px/s)", 10.0, 2000.0, 10.0)
+        self._wp_blend_var, self._wp_blend_scale = wp_slider("Blend (steps between colors)", 1.0, 24.0, 1.0)
 
         ttk.Button(editor, text="Copy from current Color crawl settings",
                    command=self._wp_copy_from_generator).grid(
             row=erow, column=0, columnspan=2, sticky="ew", pady=(10, 0))
         erow += 1
-        ttk.Label(editor, text="Grabs the colors/crawler size/gap/speed\n"
+        ttk.Label(editor, text="Grabs the colors/crawler size/gap/speed/blend\n"
                                "set in the main Color crawl controls.",
                   foreground="#666").grid(row=erow, column=0, columnspan=2, sticky="w", pady=(2, 0))
 
@@ -1429,6 +1439,8 @@ class CurveApp(tk.Tk):
         self._wp_gap_scale.refresh_label()
         self._wp_speed_var.set(preset.get("speed", 200.0))
         self._wp_speed_scale.refresh_label()
+        self._wp_blend_var.set(preset.get("blend_steps", 8.0))
+        self._wp_blend_scale.refresh_label()
 
     def _on_wallpaper_preset_selected(self, _evt=None):
         sel = self._wp_listbox.curselection()
@@ -1449,6 +1461,7 @@ class CurveApp(tk.Tk):
         preset["crawler_size"] = self._wp_size_var.get()
         preset["gap"] = self._wp_gap_var.get()
         preset["speed"] = self._wp_speed_var.get()
+        preset["blend_steps"] = self._wp_blend_var.get()
 
     def _wp_pick_color(self, var, btn, title):
         _rgb, hexval = colorchooser.askcolor(color=var.get(), title=title, parent=self._wallpaper_dialog)
@@ -1519,6 +1532,7 @@ class CurveApp(tk.Tk):
         preset["crawler_size"] = self.crawler_size_var.get()
         preset["gap"] = self.crawl_gap_var.get()
         preset["speed"] = self.crawl_speed_var.get()
+        preset["blend_steps"] = self.crawl_blend_var.get()
         self._wp_load_editor(self._wp_selected)
         self._wp_listbox.itemconfig(self._wp_selected, background=preset["colors"][0],
                                      foreground=self._contrast_text_color(preset["colors"][0]))
