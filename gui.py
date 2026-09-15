@@ -108,9 +108,8 @@ class CurveApp(tk.Tk):
         root.columnconfigure(1, weight=1)
         root.rowconfigure(0, weight=1)
 
-        controls = ttk.Frame(root)
+        controls = self._build_scrollable_controls(root)
         controls.grid(row=0, column=0, sticky="ns", padx=(0, 12))
-        self._build_controls(controls)
 
         preview = ttk.Frame(root)
         preview.grid(row=0, column=1, sticky="nsew")
@@ -118,7 +117,87 @@ class CurveApp(tk.Tk):
 
         self._update_shape_preview()  # show the default shape's border right away
 
+    def _build_scrollable_controls(self, root):
+        """Wrap the controls sidebar in a scrollable canvas so it always
+        stays reachable -- the sidebar keeps growing as features get added
+        (Color crawl was the one that first pushed Generate and everything
+        below it out of view, with no way to reach it), and a fixed window
+        height/screen size shouldn't ever be able to hide controls again.
+        Returns the container frame to `.grid(...)` in place of the old
+        plain `controls` frame; the actual widgets still go in a normal
+        `ttk.Frame` (built by `_build_controls`), just embedded in a canvas."""
+        container = ttk.Frame(root)
+        container.rowconfigure(0, weight=1)
+        container.columnconfigure(0, weight=1)
+
+        canvas = tk.Canvas(container, highlightthickness=0, borderwidth=0)
+        canvas.grid(row=0, column=0, sticky="nsew")
+        scrollbar = ttk.Scrollbar(container, orient="vertical", command=canvas.yview)
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        canvas.configure(yscrollcommand=scrollbar.set,
+                          yscrollincrement=24)  # ~one row per wheel notch, not a huge jump
+
+        controls = ttk.Frame(canvas)
+        window_id = canvas.create_window((0, 0), window=controls, anchor="nw")
+
+        def sync_scrollregion(_evt=None):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def sync_inner_width(evt):
+            # Keep the embedded frame exactly as wide as the canvas viewport
+            # so "ew"-sticky widgets inside it (sliders, full-width buttons)
+            # stretch correctly instead of clamping to their own reqwidth.
+            canvas.itemconfig(window_id, width=evt.width)
+
+        controls.bind("<Configure>", sync_scrollregion)
+        canvas.bind("<Configure>", sync_inner_width)
+
+        def scroll_units(n):
+            if canvas.bbox("all") is not None and canvas.bbox("all")[3] > canvas.winfo_height():
+                canvas.yview_scroll(n, "units")
+
+        def on_mousewheel(evt):  # Windows / macOS
+            scroll_units(int(-1 * (evt.delta / 120)) or (-1 if evt.delta > 0 else 1))
+
+        def on_wheel_up(_evt):  # Linux
+            scroll_units(-1)
+
+        def on_wheel_down(_evt):  # Linux
+            scroll_units(1)
+
+        # Only capture the scroll wheel while the pointer is actually over
+        # the sidebar, so scrolling the preview/canvas area elsewhere isn't
+        # hijacked by this binding.
+        def bind_wheel(_evt=None):
+            canvas.bind_all("<MouseWheel>", on_mousewheel)
+            canvas.bind_all("<Button-4>", on_wheel_up)
+            canvas.bind_all("<Button-5>", on_wheel_down)
+
+        def unbind_wheel(_evt=None):
+            canvas.unbind_all("<MouseWheel>")
+            canvas.unbind_all("<Button-4>")
+            canvas.unbind_all("<Button-5>")
+
+        canvas.bind("<Enter>", bind_wheel)
+        canvas.bind("<Leave>", unbind_wheel)
+
+        self._build_controls(controls)
+
+        # Size the canvas to the controls' own natural width (a bare Canvas
+        # has no opinion of its own and would otherwise squeeze the sidebar
+        # to nothing) so the sidebar's width is unchanged from before it was
+        # wrapped in a canvas; only its height is now allowed to scroll.
+        controls.update_idletasks()
+        canvas.configure(width=controls.winfo_reqwidth())
+        return container
+
     def _build_controls(self, parent):
+        # Layout order: everything that affects what Generate will produce
+        # (or how the draw-in plays back) comes first, top to bottom, ending
+        # in the Generate button itself; everything below the separator only
+        # applies to a curve that's already been generated -- appearance,
+        # color crawl, replay/save/cleanup -- since none of it means
+        # anything until a result exists to present, replay, or save.
         row = 0
 
         def add_slider(label, var, frm, to, step, fmt="{:.2f}"):
@@ -146,6 +225,8 @@ class CurveApp(tk.Tk):
         ttk.Label(parent, text="Flowing Curve Generator", font=("", 13, "bold")).grid(
             row=row, column=0, columnspan=2, sticky="w", pady=(0, 6))
         row += 1
+
+        # ================================================ before generate ====
 
         # --- Seed ---
         ttk.Label(parent, text="Seed").grid(row=row, column=0, sticky="w", pady=(8, 0))
@@ -212,9 +293,78 @@ class CurveApp(tk.Tk):
         self.smoothness_var = tk.DoubleVar(value=1.0)
         add_slider("Smoothness (0.25 tight → 3 round)", self.smoothness_var, 0.25, 3.0, 0.25, "{:.2f}")
 
+        # --- Advanced (collapsible) ---
+        self.advanced_visible = tk.BooleanVar(value=False)
+        toggle = ttk.Checkbutton(parent, text="Advanced settings", variable=self.advanced_visible,
+                                  command=self._toggle_advanced, style="Toolbutton")
+        toggle.grid(row=row, column=0, columnspan=2, sticky="w", pady=(12, 0))
+        row += 1
+
+        self.advanced_frame = ttk.Frame(parent)
+        self.advanced_frame.grid(row=row, column=0, columnspan=2, sticky="ew")
+        self.advanced_frame.grid_remove()
+        row += 1
+
+        adv_row = 0
+        self.gap_var = tk.DoubleVar(value=12.0)
+        self.preferred_gap_var = tk.DoubleVar(value=18.0)
+        self.edge_var = tk.DoubleVar(value=35.0)
+        self.iterations_var = tk.IntVar(value=50)
+        self.edge_wave_var = tk.DoubleVar(value=20.0)
+        self.attempts_var = tk.IntVar(value=60)
+
+        def add_entry(label, var):
+            nonlocal adv_row
+            ttk.Label(self.advanced_frame, text=label).grid(row=adv_row, column=0, sticky="w", pady=2)
+            ttk.Entry(self.advanced_frame, textvariable=var, width=10).grid(row=adv_row, column=1, sticky="e", pady=2)
+            adv_row += 1
+
+        add_entry("Min ink gap (px)", self.gap_var)
+        add_entry("Preferred gap (px)", self.preferred_gap_var)
+        add_entry("Edge clearance (px)", self.edge_var)
+        add_entry("Relax iterations", self.iterations_var)
+        add_entry("Edge wave (px)", self.edge_wave_var)
+        add_entry("Search attempts", self.attempts_var)
+        # Edge clearance changes the shape's own inset, so keep the border
+        # preview in sync with it too (not just shape/frame size).
+        self.edge_var.trace_add("write", lambda *_a: self._update_shape_preview())
+
+        # --- Animation ---
+        self.animate_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(parent, text="Animate drawing", variable=self.animate_var).grid(
+            row=row, column=0, columnspan=2, sticky="w", pady=(12, 0))
+        row += 1
+        self.anim_duration_var = tk.DoubleVar(value=2.5)
+        add_slider("Draw duration (s)", self.anim_duration_var, 0.5, 15.0, 0.5, "{:.1f}")
+
+        # --- Generate button + progress ---
+        self.generate_btn = ttk.Button(parent, text="Generate", command=self._start_generate)
+        self.generate_btn.grid(row=row, column=0, columnspan=2, sticky="ew", pady=(16, 4))
+        row += 1
+
+        self.progress = ttk.Progressbar(parent, mode="determinate", maximum=100)
+        self.progress.grid(row=row, column=0, columnspan=2, sticky="ew")
+        row += 1
+
+        self.skip_btn = ttk.Button(parent, text="Skip animation", command=self._skip_animation, state="disabled")
+        self.skip_btn.grid(row=row, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+        row += 1
+
+        self.status_var = tk.StringVar(value="Ready.")
+        ttk.Label(parent, textvariable=self.status_var, foreground="#444", wraplength=240).grid(
+            row=row, column=0, columnspan=2, sticky="w", pady=(4, 12))
+        row += 1
+
+        # ================================================= after generate ====
+        # Nothing below here changes what Generate produces -- it presents,
+        # animates, replays, or saves the curve that's already been made.
+        ttk.Separator(parent, orient="horizontal").grid(
+            row=row, column=0, columnspan=2, sticky="ew", pady=(4, 8))
+        row += 1
+
         # --- Appearance (pure presentation -- instant re-render, no regenerate) ---
         ttk.Label(parent, text="Appearance", font=("", 10, "bold")).grid(
-            row=row, column=0, columnspan=2, sticky="w", pady=(14, 2))
+            row=row, column=0, columnspan=2, sticky="w", pady=(2, 2))
         row += 1
 
         color_row = ttk.Frame(parent)
@@ -278,68 +428,6 @@ class CurveApp(tk.Tk):
         row += 1
         ttk.Label(parent, text="Generate once to unlock. Colors/sliders\nupdate live while it's running.",
                   foreground="#666").grid(row=row, column=0, columnspan=2, sticky="w", pady=(0, 4))
-        row += 1
-
-        # --- Advanced (collapsible) ---
-        self.advanced_visible = tk.BooleanVar(value=False)
-        toggle = ttk.Checkbutton(parent, text="Advanced settings", variable=self.advanced_visible,
-                                  command=self._toggle_advanced, style="Toolbutton")
-        toggle.grid(row=row, column=0, columnspan=2, sticky="w", pady=(12, 0))
-        row += 1
-
-        self.advanced_frame = ttk.Frame(parent)
-        self.advanced_frame.grid(row=row, column=0, columnspan=2, sticky="ew")
-        self.advanced_frame.grid_remove()
-        row += 1
-
-        adv_row = 0
-        self.gap_var = tk.DoubleVar(value=12.0)
-        self.preferred_gap_var = tk.DoubleVar(value=18.0)
-        self.edge_var = tk.DoubleVar(value=35.0)
-        self.iterations_var = tk.IntVar(value=50)
-        self.edge_wave_var = tk.DoubleVar(value=20.0)
-        self.attempts_var = tk.IntVar(value=60)
-
-        def add_entry(label, var):
-            nonlocal adv_row
-            ttk.Label(self.advanced_frame, text=label).grid(row=adv_row, column=0, sticky="w", pady=2)
-            ttk.Entry(self.advanced_frame, textvariable=var, width=10).grid(row=adv_row, column=1, sticky="e", pady=2)
-            adv_row += 1
-
-        add_entry("Min ink gap (px)", self.gap_var)
-        add_entry("Preferred gap (px)", self.preferred_gap_var)
-        add_entry("Edge clearance (px)", self.edge_var)
-        add_entry("Relax iterations", self.iterations_var)
-        add_entry("Edge wave (px)", self.edge_wave_var)
-        add_entry("Search attempts", self.attempts_var)
-        # Edge clearance changes the shape's own inset, so keep the border
-        # preview in sync with it too (not just shape/frame size).
-        self.edge_var.trace_add("write", lambda *_a: self._update_shape_preview())
-
-        # --- Animation ---
-        self.animate_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(parent, text="Animate drawing", variable=self.animate_var).grid(
-            row=row, column=0, columnspan=2, sticky="w", pady=(12, 0))
-        row += 1
-        self.anim_duration_var = tk.DoubleVar(value=2.5)
-        add_slider("Draw duration (s)", self.anim_duration_var, 0.5, 15.0, 0.5, "{:.1f}")
-
-        # --- Generate button + progress ---
-        self.generate_btn = ttk.Button(parent, text="Generate", command=self._start_generate)
-        self.generate_btn.grid(row=row, column=0, columnspan=2, sticky="ew", pady=(16, 4))
-        row += 1
-
-        self.progress = ttk.Progressbar(parent, mode="determinate", maximum=100)
-        self.progress.grid(row=row, column=0, columnspan=2, sticky="ew")
-        row += 1
-
-        self.skip_btn = ttk.Button(parent, text="Skip animation", command=self._skip_animation, state="disabled")
-        self.skip_btn.grid(row=row, column=0, columnspan=2, sticky="ew", pady=(4, 0))
-        row += 1
-
-        self.status_var = tk.StringVar(value="Ready.")
-        ttk.Label(parent, textvariable=self.status_var, foreground="#444", wraplength=240).grid(
-            row=row, column=0, columnspan=2, sticky="w", pady=(4, 12))
         row += 1
 
         # --- Replay / Save / cleanup ---
