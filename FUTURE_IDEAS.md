@@ -29,15 +29,14 @@ per-shape defaults or a corner-aware relaxation term. Net: a contained,
 medium-sized refactor of organic_curve.py's boundary logic plus a new
 "Fill shape" control in the GUI — not a rewrite of the core approach.
 
-## 2. "Replay animation" button
+## 2. "Replay animation" button ****(DONE)****
 
 Trivial. The draw-in animation code already exists and the GUI already
 holds the last generated path, colors, and stroke. Just needs a button
 (enabled once something's been generated) that re-runs `_animate_draw`
 against the current state without regenerating anything.
 
-## 3. Color strobe / traveling color effect (after generation, not the
-   draw-in reveal)
+## 3. Color strobe / traveling color effect (after draw animation)
 
 A second, independent animation: once the curve is fully on screen, cycle
 a color gradient along it continuously (like a chase-light effect) until
