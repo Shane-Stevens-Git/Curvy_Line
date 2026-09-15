@@ -7,12 +7,15 @@ generate() were deliberately written as pure functions (no Tkinter, no
 file I/O) specifically so this file could reuse them unchanged.
 
 What it does, at a glance:
-  1. Generates (or loads a same-day cached) curve for a preset each day,
-     picking the next preset from wallpaper_config.json in rotation.
-  2. Opens a borderless Tkinter window and, on Windows, reparents it behind
+  1. Opens a borderless Tkinter window and, on Windows, reparents it behind
      the desktop icons via the well-known (if undocumented) WorkerW trick,
      so it renders like a real live wallpaper instead of floating on top
      of everything.
+  2. Generates (or loads a same-day cached) curve for a preset each day,
+     picking the next preset from wallpaper_config.json in rotation --
+     always on a background thread (see WallpaperWindow), so the window
+     stays responsive/visible instead of looking hung while a curve with
+     tens of thousands of points is being laid out.
   3. Redraws the crawl animation on a timer, forever, and silently starts
      the next day's preset when the date rolls over -- no restart needed.
 
@@ -34,8 +37,10 @@ Run directly with:  python wallpaper_engine.py
 """
 import ctypes
 import json
+import queue
 import random
 import sys
+import threading
 import time
 import tkinter as tk
 from datetime import date
@@ -145,20 +150,22 @@ def current_preset(cfg):
     return presets[idx]
 
 
-def advance_if_new_day(cfg):
-    """If today's date differs from the config's last_update, move the
-    rotation forward one preset (wrapping) and persist immediately, so the
-    new choice survives a crash/reboot before the next check. Returns True
-    if the day (and therefore the preset) changed."""
-    today = date.today().isoformat()
-    if cfg.get("last_update") == today:
-        return False
+def _is_new_day(cfg):
+    return cfg.get("last_update") != date.today().isoformat()
+
+
+def _next_rotation(cfg):
+    """Pure (no mutation, no file I/O): what rotation_index/preset *would*
+    be used if the day were advanced right now. Generation runs against
+    this candidate on a background thread -- the config is only actually
+    updated (see WallpaperWindow._on_generation_done) once that generation
+    has succeeded, so a failed attempt gets retried on the next tick
+    instead of silently burning a day's rotation slot."""
     presets = cfg["presets"]
+    idx = cfg.get("rotation_index", 0) % len(presets)
     if cfg.get("last_update") is not None:  # don't skip preset 0 on first-ever run
-        cfg["rotation_index"] = (cfg.get("rotation_index", 0) + 1) % len(presets)
-    cfg["last_update"] = today
-    save_config(cfg)
-    return True
+        idx = (idx + 1) % len(presets)
+    return idx, presets[idx]
 
 
 # --- curve generation / per-day caching --------------------------------
@@ -345,10 +352,26 @@ def reparent_behind_desktop_icons(hwnd):
 class WallpaperWindow:
     """Owns the Tk root/canvas and the animation loop. Handles both the
     initial draw and, mid-run, a clean handoff to a new day's curve/preset
-    with no restart needed."""
+    with no restart needed.
+
+    Curve generation (organic_curve.generate(), which can easily take tens
+    of seconds) always runs on a background thread, never on the Tk main
+    thread. Blocking the main thread means Tk never pumps its event/paint
+    queue, so the window sits there unpainted and Windows flags it "Not
+    Responding" -- this bit us in testing (a real window, reparented or
+    not, that never gets a chance to draw itself before mainloop() starts
+    looks exactly like a hung app). Keeping generation off the main thread
+    means the window is responsive from the instant it appears, and the
+    daily preset rollover no longer freezes the animation either -- the
+    previous day's curve just keeps crawling until the new one is ready."""
 
     def __init__(self):
         self.cfg = load_config()
+        self._result_queue = queue.Queue()
+        self._generating = False
+        self.path = None
+        self.display_scale = 1.0
+        self.preset = current_preset(self.cfg)
 
         self.root = tk.Tk()
         monitor_mode = self.cfg.get("monitor_mode", "primary")
@@ -389,44 +412,90 @@ class WallpaperWindow:
 
         self._phase = 0.0
         self._last_tick = time.time()
-        self._load_today()
 
-    def _load_today(self):
-        advance_if_new_day(self.cfg)
+    def _start_generation(self):
+        """Kick off generate() on a background thread for whichever
+        preset today's rotation points to (advancing to the next preset
+        first, without saving it yet, if the day has rolled over). Safe to
+        call repeatedly -- a no-op while a generation is already in
+        flight, and self.cfg is only ever mutated back on the main thread
+        in _poll_generation once the result is in hand."""
+        if self._generating:
+            return
+        self._generating = True
+        is_new_day = _is_new_day(self.cfg)
+        idx, _preset = _next_rotation(self.cfg) if is_new_day else \
+            (self.cfg.get("rotation_index", 0) % len(self.cfg["presets"]), current_preset(self.cfg))
+        cfg_snapshot = dict(self.cfg)
+        cfg_snapshot["rotation_index"] = idx
+        w, h = self.w, self.h
+
+        def worker():
+            try:
+                path, display_scale = load_or_generate_path(cfg_snapshot, w, h)
+                self._result_queue.put(("ok", is_new_day, idx, path, display_scale))
+            except Exception as exc:  # noqa: BLE001 -- report, don't crash the daemon thread
+                self._result_queue.put(("error", str(exc)))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _poll_generation(self):
+        """Non-blocking: called every tick. Swaps in a freshly generated
+        curve as soon as the background thread finishes, and commits the
+        day/rotation-index change to disk only on success."""
+        try:
+            result = self._result_queue.get_nowait()
+        except queue.Empty:
+            return
+        self._generating = False
+        if result[0] == "error":
+            print(f"Wallpaper curve generation failed, will retry next tick: {result[1]}")
+            return
+        _, is_new_day, idx, path, display_scale = result
+        if is_new_day:
+            self.cfg["rotation_index"] = idx
+            self.cfg["last_update"] = date.today().isoformat()
+            save_config(self.cfg)
         self.preset = current_preset(self.cfg)
-        self.path, self.display_scale = load_or_generate_path(self.cfg, self.w, self.h)
+        self.path = path
+        self.display_scale = display_scale
         self._phase = 0.0
 
     def tick(self):
-        # Mid-run day rollover: check every tick (cheap: one string compare)
-        # so the engine never needs restarting at midnight.
-        if advance_if_new_day(self.cfg):
-            self.preset = current_preset(self.cfg)
-            self.path, self.display_scale = load_or_generate_path(self.cfg, self.w, self.h)
-            self._phase = 0.0
+        self._poll_generation()
+        # Mid-run day rollover: check every tick (cheap: one string
+        # compare) so the engine never needs restarting at midnight --
+        # _start_generation() itself is a no-op while one is in flight.
+        if _is_new_day(self.cfg):
+            self._start_generation()
 
         now = time.time()
         dt = max(0.0, min(0.25, now - self._last_tick))  # clamp a stall/lag spike
         self._last_tick = now
 
-        crawler_len = max(1.0, float(self.preset.get("crawler_size", 40.0)))
-        gap_len = max(0.0, float(self.preset.get("gap", 20.0)))
-        speed = max(0.0, float(self.preset.get("speed", 200.0)))
-        colors = self.preset.get("colors", DEFAULT_PRESETS[0]["colors"])
-        period = len(colors) * (crawler_len + gap_len)
-        self._phase = (self._phase + speed * dt) % period if period > 0 else 0.0
-
-        stroke = self.cfg.get("stroke", 6.0) * self.display_scale
         self.canvas.delete("all")
-        for color_idx, pts in crawl_bands(self.path, crawler_len, gap_len, self._phase, n_colors=len(colors)):
-            coords = (pts * self.display_scale).flatten().tolist()
-            self.canvas.create_line(*coords, fill=colors[color_idx],
-                                     width=max(1.0, stroke),
-                                     capstyle=tk.ROUND, joinstyle=tk.ROUND)
+        if self.path is not None:
+            crawler_len = max(1.0, float(self.preset.get("crawler_size", 40.0)))
+            gap_len = max(0.0, float(self.preset.get("gap", 20.0)))
+            speed = max(0.0, float(self.preset.get("speed", 200.0)))
+            colors = self.preset.get("colors", DEFAULT_PRESETS[0]["colors"])
+            period = len(colors) * (crawler_len + gap_len)
+            self._phase = (self._phase + speed * dt) % period if period > 0 else 0.0
+
+            stroke = self.cfg.get("stroke", 6.0) * self.display_scale
+            for color_idx, pts in crawl_bands(self.path, crawler_len, gap_len, self._phase, n_colors=len(colors)):
+                coords = (pts * self.display_scale).flatten().tolist()
+                self.canvas.create_line(*coords, fill=colors[color_idx],
+                                         width=max(1.0, stroke),
+                                         capstyle=tk.ROUND, joinstyle=tk.ROUND)
+        # else: first curve is still generating in the background -- leave
+        # the plain background color showing instead of erroring, since
+        # there's nothing to draw yet.
 
         self.root.after(FRAME_MS, self.tick)
 
     def run(self, test_seconds=None):
+        self._start_generation()  # kick off the very first curve
         self.tick()
         if test_seconds:
             # Verification-only: auto-close after N seconds instead of
