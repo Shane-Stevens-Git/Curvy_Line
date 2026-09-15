@@ -21,6 +21,14 @@ Not Windows? The WorkerW reparenting step is skipped and you get a normal
 and rotation logic on macOS/Linux even though it isn't a real wallpaper
 there.
 
+Two settings worth knowing about in wallpaper_config.json (no GUI for
+these yet -- see DEFAULT_CONFIG below for every key):
+  - "edge": how far the curve is inset from the screen's border. Small by
+    default so the pattern fills essentially the whole monitor.
+  - "monitor_mode": "primary" (default, just your main monitor) or "all"
+    (stretches one curve across every monitor combined -- looks stretched
+    rather than uniform per screen if your monitors don't match).
+
 Run directly with:  python wallpaper_engine.py
 (same .venv / dependencies as gui.py -- see run.bat/run.sh)
 """
@@ -53,16 +61,23 @@ MAX_GEN_DIMENSION = 1600
 # on the CPU/GPU for something meant to run all day, every day.
 FRAME_MS = 50
 
+# fill_shape is 'square' for every default preset -- for a wallpaper (unlike
+# the GUI's boxed preview) the whole point is to cover the monitor
+# edge-to-edge, and 'square' is the shape that means "the whole inset
+# canvas" per organic_curve.generate() -- a full rectangle, not a hexagon/
+# circle/etc inscribed inside it with empty corners around it. Combined
+# with the small `edge` config value below, this fills essentially the
+# entire screen.
 DEFAULT_PRESETS = [
     {
-        "fill_shape": "hexagon",
+        "fill_shape": "square",
         "colors": ["#ff595e", "#ffd166", "#7fe7c4"],
         "crawler_size": 60.0,
         "gap": 30.0,
         "speed": 220.0,
     },
     {
-        "fill_shape": "circle",
+        "fill_shape": "square",
         "colors": ["#5eb0ff", "#c792ff", "#7fe7c4"],
         "crawler_size": 45.0,
         "gap": 22.0,
@@ -81,6 +96,17 @@ DEFAULT_CONFIG = {
     "enabled": True,
     "bg_color": "#0b1220",
     "stroke": 6.0,
+    # How far the curve is inset from the screen's edge, in generated-curve
+    # px -- small on purpose (organic_curve.generate() requires > 0) so the
+    # pattern reaches essentially edge-to-edge instead of leaving a visible
+    # border, which is what a wallpaper needs but the GUI's boxed preview
+    # doesn't.
+    "edge": 4.0,
+    # 'primary' fills just your main monitor; 'all' stretches one curve
+    # across the combined bounding box of every monitor. See
+    # _virtual_screen_bounds() -- a real gui.py toggle for this is coming,
+    # for now edit this value directly in wallpaper_config.json.
+    "monitor_mode": "primary",
     "presets": DEFAULT_PRESETS,
     "rotation_index": 0,
     "last_update": None,
@@ -150,8 +176,8 @@ def _gen_dimensions(screen_w, screen_h):
     return gen_w, gen_h, display_scale
 
 
-def _cache_path(today, rotation_index, gen_w, gen_h):
-    return CACHE_DIR / f"{today}_{rotation_index}_{gen_w}x{gen_h}.npy"
+def _cache_path(today, rotation_index, gen_w, gen_h, edge):
+    return CACHE_DIR / f"{today}_{rotation_index}_{gen_w}x{gen_h}_{edge:g}.npy"
 
 
 def _prune_stale_cache(today):
@@ -177,7 +203,8 @@ def load_or_generate_path(cfg, screen_w, screen_h):
 
     preset = current_preset(cfg)
     gen_w, gen_h, display_scale = _gen_dimensions(screen_w, screen_h)
-    cache_file = _cache_path(today, cfg.get("rotation_index", 0), gen_w, gen_h)
+    edge = max(0.1, float(cfg.get("edge", 4.0)))
+    cache_file = _cache_path(today, cfg.get("rotation_index", 0), gen_w, gen_h, edge)
 
     if cache_file.exists():
         try:
@@ -192,6 +219,7 @@ def load_or_generate_path(cfg, screen_w, screen_h):
             path, _report = generate(
                 size=(gen_w, gen_h),
                 stroke=cfg.get("stroke", 6.0),
+                edge=edge,
                 seed=seed,
                 fill_shape=preset.get("fill_shape", "square")
                 if preset.get("fill_shape") in FILL_SHAPES else "square",
@@ -205,30 +233,44 @@ def load_or_generate_path(cfg, screen_w, screen_h):
 
 # --- Windows WorkerW desktop-icon-layer reparenting --------------------
 
-def _virtual_screen_bounds(fallback_root=None):
-    """Bounding box of ALL monitors combined (not just the primary one),
-    via GetSystemMetrics' SM_XVIRTUALSCREEN/SM_YVIRTUALSCREEN/
-    SM_C{X,Y}VIRTUALSCREEN -- so the wallpaper spans a multi-monitor setup
-    edge-to-edge instead of only covering monitor 1.
+def _virtual_screen_bounds(fallback_root=None, monitor_mode="primary"):
+    """Screen bounds to cover, in one of two modes:
+
+    'primary' (default) -- just the main monitor, via GetSystemMetrics'
+    SM_CXSCREEN/SM_CYSCREEN, origin (0, 0).
+
+    'all' -- every monitor combined, via SM_XVIRTUALSCREEN/
+    SM_YVIRTUALSCREEN/SM_C{X,Y}VIRTUALSCREEN, so a single curve is
+    stretched across the whole multi-monitor bounding box edge-to-edge
+    (not the same as one wallpaper mirrored per monitor -- if your
+    monitors differ in resolution or aspect ratio, "all" will look
+    stretched rather than uniform on each screen).
 
     ctypes.windll only exists on Windows, so on any other platform (used
     here only for testing the animation/rotation logic, since the
     desktop-icon reparenting trick itself is Windows-only anyway) this
-    falls back to the single display Tk already knows about."""
+    falls back to the single display Tk already knows about, regardless
+    of monitor_mode."""
     if sys.platform != "win32":
         if fallback_root is not None:
             return 0, 0, fallback_root.winfo_screenwidth(), fallback_root.winfo_screenheight()
         return 0, 0, 1920, 1080
 
     user32 = ctypes.windll.user32
-    x = user32.GetSystemMetrics(76)  # SM_XVIRTUALSCREEN
-    y = user32.GetSystemMetrics(77)  # SM_YVIRTUALSCREEN
-    w = user32.GetSystemMetrics(78)  # SM_CXVIRTUALSCREEN
-    h = user32.GetSystemMetrics(79)  # SM_CYVIRTUALSCREEN
-    if w <= 0 or h <= 0:  # defensive fallback, shouldn't happen
-        w = user32.GetSystemMetrics(0)
-        h = user32.GetSystemMetrics(1)
-    return x, y, w, h
+
+    if monitor_mode == "all":
+        x = user32.GetSystemMetrics(76)  # SM_XVIRTUALSCREEN
+        y = user32.GetSystemMetrics(77)  # SM_YVIRTUALSCREEN
+        w = user32.GetSystemMetrics(78)  # SM_CXVIRTUALSCREEN
+        h = user32.GetSystemMetrics(79)  # SM_CYVIRTUALSCREEN
+        if w > 0 and h > 0:
+            return x, y, w, h
+        # fall through to primary-monitor metrics if the virtual-screen
+        # ones came back empty, which shouldn't normally happen
+
+    w = user32.GetSystemMetrics(0)  # SM_CXSCREEN
+    h = user32.GetSystemMetrics(1)  # SM_CYSCREEN
+    return 0, 0, w, h
 
 
 def reparent_behind_desktop_icons(hwnd):
@@ -309,7 +351,10 @@ class WallpaperWindow:
         self.cfg = load_config()
 
         self.root = tk.Tk()
-        self.x, self.y, self.w, self.h = _virtual_screen_bounds(self.root)
+        monitor_mode = self.cfg.get("monitor_mode", "primary")
+        if monitor_mode not in ("primary", "all"):
+            monitor_mode = "primary"
+        self.x, self.y, self.w, self.h = _virtual_screen_bounds(self.root, monitor_mode)
         self.root.overrideredirect(True)
         self.root.geometry(f"{self.w}x{self.h}+{self.x}+{self.y}")
         self.root.configure(bg=self.cfg.get("bg_color", "#0b1220"))
