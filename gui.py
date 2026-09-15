@@ -1245,9 +1245,9 @@ class CurveApp(tk.Tk):
         ttk.Button(list_btn_row, text="▼", width=3, command=lambda: self._wp_move_preset(1)).grid(
             row=1, column=1, padx=1, pady=1)
 
-        # --- selected-preset editor (right column, top) ---
+        # --- selected-preset editor (column 1) ---
         editor = ttk.Frame(pad)
-        editor.grid(row=0, column=1, sticky="n")
+        editor.grid(row=0, column=1, sticky="n", padx=(0, 14))
         erow = 0
 
         ttk.Label(editor, text="Selected preset", font=("", 10, "bold")).grid(
@@ -1309,14 +1309,15 @@ class CurveApp(tk.Tk):
                                "set in the main Color crawl controls.",
                   foreground="#666").grid(row=erow, column=0, columnspan=2, sticky="w", pady=(2, 0))
 
-        # --- global display settings (bottom, full width) ---
-        ttk.Separator(pad, orient="horizontal").grid(row=1, column=0, columnspan=2, sticky="ew", pady=(14, 10))
-        grow = 2
-        ttk.Label(pad, text="Display settings", font=("", 10, "bold")).grid(
+        # --- global display/monitor/rendering settings (column 2) ---
+        globals_frame = ttk.Frame(pad)
+        globals_frame.grid(row=0, column=2, sticky="n")
+        grow = 0
+        ttk.Label(globals_frame, text="Display settings", font=("", 10, "bold")).grid(
             row=grow, column=0, columnspan=2, sticky="w")
         grow += 1
 
-        bg_row = ttk.Frame(pad)
+        bg_row = ttk.Frame(globals_frame)
         bg_row.grid(row=grow, column=0, columnspan=2, sticky="w", pady=(6, 0))
         grow += 1
         ttk.Label(bg_row, text="Background:").pack(side="left")
@@ -1329,9 +1330,9 @@ class CurveApp(tk.Tk):
 
         def wp_global_slider(label, key, frm, to, step, fmt="{:.1f}"):
             nonlocal grow
-            ttk.Label(pad, text=label).grid(row=grow, column=0, columnspan=2, sticky="w", pady=(8, 0))
+            ttk.Label(globals_frame, text=label).grid(row=grow, column=0, columnspan=2, sticky="w", pady=(8, 0))
             grow += 1
-            val_label = ttk.Label(pad, text=fmt.format(self._wp_cfg.get(key, frm)), width=8)
+            val_label = ttk.Label(globals_frame, text=fmt.format(self._wp_cfg.get(key, frm)), width=8)
             val_label.grid(row=grow, column=1, sticky="e")
             var = tk.DoubleVar(value=self._wp_cfg.get(key, frm))
 
@@ -1341,21 +1342,21 @@ class CurveApp(tk.Tk):
                 l.config(text=f.format(snapped))
                 self._wp_cfg[k] = snapped
 
-            scale = ttk.Scale(pad, from_=frm, to=to, variable=var, command=lambda _v: on_move())
+            scale = ttk.Scale(globals_frame, from_=frm, to=to, variable=var, command=lambda _v: on_move())
             scale.grid(row=grow, column=0, sticky="ew")
             grow += 1
             return var
 
         self._wp_stroke_var = wp_global_slider("Stroke width (px)", "stroke", 1.0, 20.0, 0.5)
         self._wp_edge_var = wp_global_slider("Edge inset (px)", "edge", 0.5, 60.0, 0.5)
-        ttk.Label(pad, text="Keep this small so the pattern reaches\nessentially edge-to-edge.",
+        ttk.Label(globals_frame, text="Keep this small so the pattern reaches\nessentially edge-to-edge.",
                   foreground="#666").grid(row=grow, column=0, columnspan=2, sticky="w", pady=(0, 4))
         grow += 1
 
-        ttk.Label(pad, text="Monitors").grid(row=grow, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        ttk.Label(globals_frame, text="Monitors").grid(row=grow, column=0, columnspan=2, sticky="w", pady=(8, 0))
         grow += 1
         self._wp_monitor_var = tk.StringVar(value=self._wp_cfg.get("monitor_mode", "primary"))
-        mon_row = ttk.Frame(pad)
+        mon_row = ttk.Frame(globals_frame)
         mon_row.grid(row=grow, column=0, columnspan=2, sticky="w")
         grow += 1
         ttk.Radiobutton(mon_row, text="This monitor only", value="primary", variable=self._wp_monitor_var,
@@ -1363,14 +1364,14 @@ class CurveApp(tk.Tk):
         ttk.Radiobutton(mon_row, text="Stretch across all monitors", value="all", variable=self._wp_monitor_var,
                          command=self._wp_monitor_changed).pack(anchor="w")
 
-        ttk.Label(pad, text="Rendering").grid(row=grow, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        ttk.Label(globals_frame, text="Rendering").grid(row=grow, column=0, columnspan=2, sticky="w", pady=(8, 0))
         grow += 1
         self._wp_reparent_var = tk.BooleanVar(value=bool(self._wp_cfg.get("attempt_worker_reparent", False)))
-        ttk.Checkbutton(pad, text="Render behind desktop icons (experimental)",
+        ttk.Checkbutton(globals_frame, text="Render behind desktop icons (experimental)",
                          variable=self._wp_reparent_var, command=self._wp_reparent_changed).grid(
             row=grow, column=0, columnspan=2, sticky="w")
         grow += 1
-        ttk.Label(pad, text="Off by default because this froze all clicks on the\n"
+        ttk.Label(globals_frame, text="Off by default because this froze all clicks on the\n"
                             "monitor the wallpaper was on until it was fixed by\n"
                             "testing. With it off (recommended), the wallpaper sits\n"
                             "on top of your icons instead of behind them -- clicks\n"
@@ -1380,18 +1381,18 @@ class CurveApp(tk.Tk):
                   foreground="#a15c00").grid(row=grow, column=0, columnspan=2, sticky="w", pady=(2, 4))
         grow += 1
 
-        # --- run controls ---
-        ttk.Separator(pad, orient="horizontal").grid(row=grow, column=0, columnspan=2, sticky="ew", pady=(14, 10))
-        grow += 1
+        # --- run controls (full width, below all 3 columns) ---
+        ttk.Separator(pad, orient="horizontal").grid(row=1, column=0, columnspan=3, sticky="ew", pady=(14, 10))
+        rrow = 2
         status_row = ttk.Frame(pad)
-        status_row.grid(row=grow, column=0, columnspan=2, sticky="ew")
-        grow += 1
+        status_row.grid(row=rrow, column=0, columnspan=3, sticky="ew")
+        rrow += 1
         ttk.Label(status_row, text="Status:").pack(side="left")
         ttk.Label(status_row, textvariable=self._wallpaper_status_var).pack(side="left", padx=(4, 0))
 
         run_row = ttk.Frame(pad)
-        run_row.grid(row=grow, column=0, columnspan=2, sticky="ew", pady=(4, 0))
-        grow += 1
+        run_row.grid(row=rrow, column=0, columnspan=3, sticky="ew", pady=(4, 0))
+        rrow += 1
         self._wp_start_btn = ttk.Button(run_row, text="Start Wallpaper Now", command=self._wp_start)
         self._wp_start_btn.pack(side="left", fill="x", expand=True)
         self._wp_stop_btn = ttk.Button(run_row, text="Stop Wallpaper", command=self._wp_stop)
@@ -1399,11 +1400,11 @@ class CurveApp(tk.Tk):
         ttk.Label(pad, text="Starting saves your changes first, then runs\n"
                             "wallpaper_engine.py in the background -- it keeps\n"
                             "going even after you close this window or the app.",
-                  foreground="#666").grid(row=grow, column=0, columnspan=2, sticky="w", pady=(4, 0))
-        grow += 1
+                  foreground="#666").grid(row=rrow, column=0, columnspan=3, sticky="w", pady=(4, 0))
+        rrow += 1
 
         bottom_row = ttk.Frame(pad)
-        bottom_row.grid(row=grow, column=0, columnspan=2, sticky="ew", pady=(14, 0))
+        bottom_row.grid(row=rrow, column=0, columnspan=3, sticky="ew", pady=(14, 0))
         ttk.Button(bottom_row, text="Save", command=self._wp_save).pack(side="left", fill="x", expand=True)
         ttk.Button(bottom_row, text="Close", command=self._close_wallpaper_dialog).pack(
             side="left", fill="x", expand=True, padx=(6, 0))
