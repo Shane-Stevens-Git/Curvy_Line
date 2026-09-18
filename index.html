@@ -420,13 +420,6 @@
         closes on any input, with a live preview thumbnail in Windows' own
         Settings. Built, installed, and tried out entirely from the app itself.</p>
       </div>
-      <div class="feature">
-        <h4>App icon &amp; Desktop shortcut (Windows)</h4>
-        <p>The app's own generated-curve icon replaces the default window icon, and
-        a one-click <strong>Create Desktop Shortcut...</strong> button (or a Y/N
-        prompt the first time you run <code>run.bat</code>) adds a "Flowing Curve
-        Generator" shortcut to your Desktop, using that same icon.</p>
-      </div>
     </div>
   </section>
 
@@ -537,6 +530,8 @@ python gui.py</code></pre>
       </div>
     </dl>
 
+    <img src="screenshots/gui-live-wallpaper-section.png" alt="The bottom of the sidebar after generating: Appearance, Color crawl with the Blend slider, Save As, Export for pen plotter, Clear saved copies, Configure Wallpaper, Screensaver, and Create Desktop Shortcut" style="margin: 1rem 0; border: 1px solid var(--border);">
+
     <span class="section-tag after">After you have a result</span>
     <dl>
       <div class="usage-block">
@@ -584,14 +579,7 @@ python gui.py</code></pre>
       <strong>Configure Wallpaper...</strong> is exactly what ends up on your desktop.
     </p>
 
-    <div class="two-col">
-      <div>
-        <img src="screenshots/gui-live-wallpaper-section.png" alt="The bottom of the sidebar after generating: Appearance, Color crawl with the Blend slider, Save As, Export for pen plotter, Clear saved copies, Configure Wallpaper, Screensaver, and Create Desktop Shortcut" style="border: 1px solid var(--border);">
-      </div>
-      <div>
-        <img src="screenshots/wallpaper-dialog.png" alt="The Configure Wallpaper dialog, showing daily preset rotation, per-preset colors and blend, display settings, monitor choice, the render-behind-icons checkbox, and the battery-throttling checkbox" style="border: 1px solid var(--border);">
-      </div>
-    </div>
+    <img src="screenshots/wallpaper-dialog.png" alt="The Configure Wallpaper dialog, showing daily preset rotation, per-preset colors and blend, display settings, monitor choice, the render-behind-icons checkbox, and the battery-throttling checkbox" style="max-width: 600px; margin: 1rem 0; border: 1px solid var(--border);">
 
     <h3>What it does</h3>
     <ul class="list">
@@ -607,10 +595,10 @@ python gui.py</code></pre>
       <li><strong>Monitors</strong> &mdash; run on just the monitor the app is on, or
       stretch the same pattern across all of them, with an independent process (and
       independent Start/Stop) per monitor.</li>
-      <li><strong>Start Wallpaper Now / Stop Wallpaper</strong> &mdash; saves your
-      changes and launches (or stops) <code>wallpaper_engine.py</code> as its own
-      background process, so it survives closing the dialog, the app, or your sign-in
-      session.</li>
+      <li>Each monitor's <strong>Start</strong> / <strong>Stop</strong> button saves
+      your changes and launches (or stops) <code>wallpaper_engine.py</code> as its
+      own background process, so it survives closing the dialog, the app, or your
+      sign-in session.</li>
       <li><strong>Battery-aware throttling</strong> &mdash; on a laptop running on
       battery, the animation automatically slows down, and pauses entirely below a
       low-battery threshold, resuming at full speed the moment it's plugged back in.
@@ -618,19 +606,10 @@ python gui.py</code></pre>
     </ul>
 
     <div class="callout">
-      <strong>Render behind desktop icons:</strong> Windows has a well-known trick
-      for placing a window behind your desktop icons instead of on top of them, and
-      this app uses it so the wallpaper doesn't visually cover your icons while it
-      runs. An earlier version of this had a bug: on some setups it froze mouse
-      clicks on whichever monitor the wallpaper was on, until that window was
-      minimized. The root cause turned out to be a second, hidden window that Tk
-      itself creates for its own bookkeeping &mdash; the fix hardens <em>every</em>
-      top-level window the app owns against the trick's side effects, not just the
-      one it already knew about. Confirmed fixed on the real multi-monitor machine
-      that reproduced the freeze for months: no more freeze, running cleanly behind
-      the icons. It's on by default now; the checkbox in this dialog is only there
-      if you'd rather turn it off and have the wallpaper sit on top of your icons
-      instead.
+      <strong>Render behind desktop icons</strong> used to cause a click-freeze bug
+      on some machines &mdash; that's been found and fixed. If you ever run into
+      clicks not responding on a monitor running the wallpaper, this is the first
+      thing to suspect: uncheck the box in this dialog.
     </div>
   </section>
 
@@ -700,13 +679,13 @@ python gui.py</code></pre>
       <tr><th>File</th><th>What it is</th></tr>
       <tr><td><code>organic_curve.py</code></td><td>The generation algorithm and PNG/SVG rendering &mdash; usable standalone from the command line, or imported by the GUI.</td></tr>
       <tr><td><code>gui.py</code></td><td>The desktop app (this is what <code>run.bat</code> / <code>run.sh</code> launch).</td></tr>
-      <tr><td><code>wallpaper_engine.py</code></td><td>The background live-wallpaper process, launched by <strong>Start Wallpaper Now</strong> in <code>gui.py</code>'s <strong>Configure Wallpaper...</strong> dialog &mdash; Windows only.</td></tr>
+      <tr><td><code>wallpaper_engine.py</code></td><td>The background live-wallpaper process, one instance per monitor, launched by <strong>Start</strong> in <code>gui.py</code>'s <strong>Configure Wallpaper...</strong> dialog &mdash; Windows only.</td></tr>
       <tr><td><code>screensaver.py</code></td><td>The screen saver &mdash; reuses <code>wallpaper_engine.py</code>'s generation/rendering, packaged as a standard Windows <code>.scr</code>. Built, installed, and previewed from <code>gui.py</code>'s <strong>Screensaver...</strong> dialog &mdash; Windows only.</td></tr>
       <tr><td><code>requirements.txt</code></td><td>Python dependencies (numpy, scipy, shapely, Pillow).</td></tr>
       <tr><td><code>run.bat</code> / <code>run.sh</code></td><td>One-click setup + launch, for Windows and macOS/Linux respectively &mdash; already in every clone.</td></tr>
       <tr><td><code>install.bat</code> / <code>install.sh</code></td><td>The standalone installer linked at the top of this page &mdash; downloads the whole project fresh, then hands off to <code>run.bat</code> / <code>run.sh</code> above.</td></tr>
       <tr><td><code>build_screensaver.bat</code> / <code>install_screensaver.bat</code></td><td>A no-GUI fallback for packaging/installing the screen saver &mdash; the <strong>Screensaver...</strong> dialog above does the same thing with a button instead.</td></tr>
-      <tr><td><code>assets/</code></td><td>The app's own icon (<code>icon.png</code> for the window/taskbar icon, <code>icon.ico</code> for the <strong>Create Desktop Shortcut...</strong> button's shortcut).</td></tr>
+      <tr><td><code>assets/</code></td><td>The app's own icon &mdash; <code>icon.png</code> for the window/taskbar icon, <code>icon.ico</code> for the Desktop shortcut (used by both <strong>Create Desktop Shortcut...</strong> in the sidebar and <code>run.bat</code>'s first-run prompt).</td></tr>
       <tr><td><code>outputs/</code></td><td>Where the app writes the current preview and anything saved with "Save As...".</td></tr>
       <tr><td><code>wallpaper_config.json</code></td><td>Your saved wallpaper presets and settings &mdash; created on first use of <strong>Configure Wallpaper...</strong>, not part of the source.</td></tr>
     </table>
