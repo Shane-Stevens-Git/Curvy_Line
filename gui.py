@@ -51,7 +51,7 @@ import sys
 import threading
 import time
 import tkinter as tk
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from tkinter import colorchooser, ttk, filedialog, messagebox
 
@@ -72,6 +72,8 @@ from wallpaper_engine import (load_config as load_wallpaper_config,
 
 OUTPUT_DIR = Path(__file__).parent / "outputs"
 WALLPAPER_ENGINE_PATH = Path(__file__).parent / "wallpaper_engine.py"
+SCREENSAVER_SCRIPT_PATH = Path(__file__).parent / "screensaver.py"
+SCREENSAVER_SCR_PATH = Path(__file__).parent / "screensaver.scr"
 WALLPAPER_SHAPE_CHOICES = [s for s in FILL_SHAPES if s != "custom"]  # 'custom' needs a hand-drawn
                                                                        # region, not meaningful per-preset
 PREVIEW_BASENAME = "preview"
@@ -125,6 +127,17 @@ class CurveApp(tk.Tk):
         # (see wallpaper_lock_pid_for_monitor).
         self._wallpaper_dialog = None
         self._wallpaper_procs = {}
+
+        # Screensaver dialog state (see _open_screensaver_dialog). The
+        # build itself runs on a background thread that streams its
+        # PyInstaller output into self._ss_log_queue, polled by
+        # _ss_poll_log for as long as the dialog stays open -- same
+        # thread/queue/self.after shape as the main generate-a-curve flow
+        # (self.worker_queue/_poll_queue) above, just scoped to this
+        # dialog instead of the whole app.
+        self._ss_dialog = None
+        self._ss_log_queue = None
+        self._ss_building = False
 
         OUTPUT_DIR.mkdir(exist_ok=True)
 
@@ -498,6 +511,13 @@ class CurveApp(tk.Tk):
         row += 1
         ttk.Label(parent, text="Windows only. A rotating set of colors/shapes\n"
                                "crawling behind your desktop icons, one per day.",
+                  foreground="#666").grid(row=row, column=0, columnspan=2, sticky="w", pady=(2, 0))
+        row += 1
+        ttk.Button(parent, text="Screensaver...", command=self._open_screensaver_dialog).grid(
+            row=row, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        row += 1
+        ttk.Label(parent, text="Windows only. Build and install the same\n"
+                               "curves as your actual screen saver.",
                   foreground="#666").grid(row=row, column=0, columnspan=2, sticky="w", pady=(2, 0))
         row += 1
 
@@ -1892,6 +1912,348 @@ class CurveApp(tk.Tk):
             "Either way, generating a full-resolution curve can take "
             "several minutes -- that's expected, not frozen.",
             parent=self._wallpaper_dialog)
+
+    # ------------------------------------------------------ screensaver ----
+    # Everything below lets the whole screensaver.py setup -- build with
+    # PyInstaller, install via the registry, try it, turn it off again --
+    # happen from inside this app instead of requiring build_screensaver.bat/
+    # install_screensaver.bat to be run by hand from Explorer/a terminal.
+    # Those two .bat files are kept as-is (a no-GUI fallback, and what this
+    # dialog's Build/Install buttons are equivalent to under the hood), but
+    # this dialog is the path meant for normal use.
+
+    def _open_screensaver_dialog(self):
+        if self._ss_dialog is not None and self._ss_dialog.winfo_exists():
+            self._ss_dialog.lift()
+            self._ss_dialog.focus_force()
+            return
+
+        win = tk.Toplevel(self)
+        win.title("Screensaver")
+        win.resizable(False, False)
+        win.transient(self)
+        win.protocol("WM_DELETE_WINDOW", self._close_screensaver_dialog)
+        self._ss_dialog = win
+        self._ss_log_queue = queue.Queue()
+
+        self._build_screensaver_dialog(win)
+        self._ss_refresh_status()
+        self._ss_poll_log()
+
+    def _close_screensaver_dialog(self):
+        if self._ss_building:
+            if not messagebox.askyesno(
+                    "Build in progress",
+                    "The screensaver is still building. Close this window anyway?\n\n"
+                    "The build itself will keep running in the background either way "
+                    "-- this just closes the window showing its progress.",
+                    parent=self._ss_dialog):
+                return
+        self._ss_dialog.destroy()
+        self._ss_dialog = None
+        self._ss_log_queue = None
+
+    def _build_screensaver_dialog(self, win):
+        pad = ttk.Frame(win, padding=12)
+        pad.grid(row=0, column=0, sticky="nsew")
+        pad.columnconfigure(0, weight=1)
+
+        ttk.Label(pad, text="Screensaver", font=("", 10, "bold")).grid(
+            row=0, column=0, sticky="w")
+        ttk.Label(pad,
+                  text="Same curves, presets, and daily rotation as the live wallpaper\n"
+                       "above (they share the same settings) -- just packaged to run as\n"
+                       "an actual Windows screen saver instead.",
+                  foreground="#666", justify="left").grid(row=1, column=0, sticky="w", pady=(2, 10))
+
+        self._ss_status_var = tk.StringVar(value="Checking...")
+        ttk.Label(pad, textvariable=self._ss_status_var, foreground="#444").grid(
+            row=2, column=0, sticky="w", pady=(0, 8))
+
+        self.ss_preview_btn = ttk.Button(pad, text="Preview now (fullscreen)",
+                                          command=self._ss_preview_now)
+        self.ss_preview_btn.grid(row=3, column=0, sticky="ew")
+        ttk.Label(pad, text="Runs the actual screensaver full-screen right now, without "
+                            "needing to build or install it first -- move the mouse, "
+                            "click, or press a key to close it, same as the real thing.",
+                  foreground="#666", justify="left", wraplength=340).grid(
+            row=4, column=0, sticky="w", pady=(2, 10))
+
+        ttk.Separator(pad, orient="horizontal").grid(row=5, column=0, sticky="ew", pady=(0, 8))
+        ttk.Label(pad, text="Windows only, below this line", foreground="#888",
+                  font=("", 8, "italic")).grid(row=6, column=0, sticky="w", pady=(0, 6))
+
+        windows = (sys.platform == "win32")
+
+        self.ss_build_btn = ttk.Button(pad, text="Build .scr (PyInstaller)...",
+                                        command=self._ss_start_build,
+                                        state="normal" if windows else "disabled")
+        self.ss_build_btn.grid(row=7, column=0, sticky="ew")
+        row = 8
+        if not windows:
+            ttk.Label(pad, text="(Packaging the .scr has to happen on a real Windows "
+                                "machine -- this button is disabled here.)",
+                      foreground="#888", justify="left", wraplength=340).grid(
+                row=row, column=0, sticky="w", pady=(2, 0))
+            row += 1
+
+        self.ss_install_btn = ttk.Button(pad, text="Install as screen saver",
+                                          command=self._ss_install,
+                                          state="disabled")
+        self.ss_install_btn.grid(row=row, column=0, sticky="ew", pady=(8, 0))
+        row += 1
+
+        self.ss_turnoff_btn = ttk.Button(pad, text="Turn off screen saver",
+                                          command=self._ss_turn_off,
+                                          state="normal" if windows else "disabled")
+        self.ss_turnoff_btn.grid(row=row, column=0, sticky="ew", pady=(4, 0))
+        row += 1
+
+        self.ss_settings_btn = ttk.Button(pad, text="Open Windows Screen Saver Settings...",
+                                           command=self._ss_open_settings,
+                                           state="normal" if windows else "disabled")
+        self.ss_settings_btn.grid(row=row, column=0, sticky="ew", pady=(4, 10))
+        row += 1
+
+        ttk.Label(pad, text="Build log", font=("", 9, "bold")).grid(
+            row=row, column=0, sticky="w")
+        row += 1
+        log_frame = ttk.Frame(pad)
+        log_frame.grid(row=row, column=0, sticky="ew")
+        self.ss_log_text = tk.Text(log_frame, height=10, width=54, wrap="word", state="disabled")
+        self.ss_log_text.pack(side="left", fill="both", expand=True)
+        log_scroll = ttk.Scrollbar(log_frame, orient="vertical", command=self.ss_log_text.yview)
+        log_scroll.pack(side="right", fill="y")
+        self.ss_log_text.config(yscrollcommand=log_scroll.set)
+
+    def _ss_refresh_status(self):
+        """Updates the status line and Install button based on whether
+        screensaver.scr currently exists next to this file, and -- on
+        Windows -- whether it (or anything) is currently the registered
+        SCRNSAVE.EXE."""
+        if self._ss_dialog is None or not self._ss_dialog.winfo_exists():
+            return
+        built = SCREENSAVER_SCR_PATH.exists()
+        active = False
+        active_path = None
+        if sys.platform == "win32":
+            try:
+                import winreg
+                with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Control Panel\Desktop") as key:
+                    try:
+                        active = winreg.QueryValueEx(key, "ScreenSaveActive")[0] == "1"
+                    except FileNotFoundError:
+                        active = False
+                    try:
+                        active_path = winreg.QueryValueEx(key, "SCRNSAVE.EXE")[0]
+                    except FileNotFoundError:
+                        active_path = None
+            except OSError:
+                pass
+
+        is_this_one = (active_path is not None
+                        and Path(active_path).resolve() == SCREENSAVER_SCR_PATH.resolve())
+        if not built:
+            self._ss_status_var.set("Not built yet -- click \"Build .scr\" below.")
+        elif active and is_this_one:
+            mtime = datetime.fromtimestamp(SCREENSAVER_SCR_PATH.stat().st_mtime)
+            self._ss_status_var.set(
+                f"Built {mtime:%Y-%m-%d %H:%M} -- installed and currently active.")
+        elif built and active_path is not None and not is_this_one:
+            mtime = datetime.fromtimestamp(SCREENSAVER_SCR_PATH.stat().st_mtime)
+            self._ss_status_var.set(
+                f"Built {mtime:%Y-%m-%d %H:%M} -- not installed "
+                f"(a different screen saver is currently active).")
+        else:
+            mtime = datetime.fromtimestamp(SCREENSAVER_SCR_PATH.stat().st_mtime)
+            self._ss_status_var.set(
+                f"Built {mtime:%Y-%m-%d %H:%M} -- not installed yet.")
+
+        self.ss_install_btn.config(
+            state="normal" if (built and sys.platform == "win32") else "disabled")
+
+    def _ss_log(self, text):
+        """Appends a line to the build-log box directly -- only ever call
+        this from the main thread (dialog button handlers). The background
+        build thread instead puts strings on self._ss_log_queue, drained by
+        _ss_poll_log, since Tk widgets aren't safe to touch off-thread."""
+        if self._ss_dialog is None or not self._ss_dialog.winfo_exists():
+            return
+        self.ss_log_text.config(state="normal")
+        self.ss_log_text.insert("end", text.rstrip("\n") + "\n")
+        self.ss_log_text.see("end")
+        self.ss_log_text.config(state="disabled")
+
+    def _ss_poll_log(self):
+        if self._ss_dialog is None or not self._ss_dialog.winfo_exists():
+            return
+        try:
+            while True:
+                msg = self._ss_log_queue.get_nowait()
+                kind = msg[0]
+                if kind == "line":
+                    self._ss_log(msg[1])
+                elif kind == "done":
+                    _, success, summary = msg
+                    self._ss_building = False
+                    self.ss_build_btn.config(state="normal" if sys.platform == "win32" else "disabled")
+                    self._ss_log(summary)
+                    self._ss_refresh_status()
+                    if not success:
+                        messagebox.showerror("Build failed", summary, parent=self._ss_dialog)
+        except queue.Empty:
+            pass
+        self.after(150, self._ss_poll_log)
+
+    def _ss_preview_now(self):
+        """Runs screensaver.py /s as its own process, live off whatever's
+        currently in wallpaper_config.json -- works with or without a built
+        .scr (screensaver.py itself runs fine unfrozen, on any platform --
+        see its own module docstring), so this is the quickest way to see
+        a change without waiting on a full PyInstaller build."""
+        kwargs = {}
+        if sys.platform == "win32":
+            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+        try:
+            subprocess.Popen(
+                [sys.executable, str(SCREENSAVER_SCRIPT_PATH), "/s"],
+                cwd=str(SCREENSAVER_SCRIPT_PATH.parent),
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                **kwargs,
+            )
+        except OSError as e:
+            messagebox.showerror("Could not start preview", str(e), parent=self._ss_dialog)
+
+    def _ss_start_build(self):
+        if self._ss_building:
+            return
+        if sys.platform != "win32":
+            messagebox.showinfo("Windows only",
+                                 "Building the .scr has to happen on a real Windows machine.",
+                                 parent=self._ss_dialog)
+            return
+        self._ss_building = True
+        self.ss_build_btn.config(state="disabled")
+        self.ss_log_text.config(state="normal")
+        self.ss_log_text.delete("1.0", "end")
+        self.ss_log_text.config(state="disabled")
+        self._ss_status_var.set("Building...")
+        log_queue = self._ss_log_queue
+        thread = threading.Thread(target=self._ss_build_worker, args=(log_queue,), daemon=True)
+        thread.start()
+
+    def _ss_build_worker(self, log_queue):
+        """Runs on a background thread -- mirrors build_screensaver.bat
+        step for step (see that file's own comments for why --onefile,
+        why --hidden-import, why the copy to screensaver.scr afterward),
+        just using sys.executable directly instead of a hardcoded
+        .venv\\Scripts\\python.exe path, since this *is* already running
+        inside whichever interpreter the app itself was started with."""
+        project_dir = str(SCREENSAVER_SCRIPT_PATH.parent)
+
+        def run_streamed(cmd, log_prefix):
+            log_queue.put(("line", f"$ {' '.join(cmd)}"))
+            try:
+                proc = subprocess.Popen(
+                    cmd, cwd=project_dir,
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, bufsize=1,
+                    creationflags=subprocess.CREATE_NO_WINDOW,
+                )
+            except OSError as e:
+                log_queue.put(("line", f"{log_prefix}: failed to start -- {e}"))
+                return 1
+            for line in proc.stdout:
+                log_queue.put(("line", line))
+            proc.wait()
+            return proc.returncode
+
+        rc = run_streamed([sys.executable, "-m", "pip", "install", "--upgrade", "pyinstaller"],
+                           "pip install pyinstaller")
+        if rc != 0:
+            log_queue.put(("done", False, "Failed to install PyInstaller -- see the log above."))
+            return
+
+        rc = run_streamed([
+            sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean", "--onefile", "--windowed",
+            "--name", "screensaver",
+            "--hidden-import", "gui",
+            "--hidden-import", "organic_curve",
+            "--hidden-import", "wallpaper_engine",
+            "screensaver.py",
+        ], "PyInstaller build")
+        if rc != 0:
+            log_queue.put(("done", False, "PyInstaller build failed -- see the log above."))
+            return
+
+        built_exe = Path(project_dir) / "dist" / "screensaver.exe"
+        if not built_exe.exists():
+            log_queue.put(("done", False,
+                            "Build finished but dist\\screensaver.exe was not found -- "
+                            "something went wrong. See the log above."))
+            return
+
+        try:
+            shutil.copyfile(built_exe, SCREENSAVER_SCR_PATH)
+        except OSError as e:
+            log_queue.put(("done", False, f"Could not copy the built exe to screensaver.scr: {e}"))
+            return
+
+        log_queue.put(("done", True, "Build complete -- screensaver.scr is ready. "
+                                      "Click \"Install as screen saver\" next."))
+
+    def _ss_install(self):
+        if sys.platform != "win32":
+            return
+        if not SCREENSAVER_SCR_PATH.exists():
+            messagebox.showerror("Not built yet", "Build the screensaver first.", parent=self._ss_dialog)
+            return
+        try:
+            import winreg
+            with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, r"Control Panel\Desktop",
+                                     0, winreg.KEY_SET_VALUE | winreg.KEY_QUERY_VALUE) as key:
+                winreg.SetValueEx(key, "SCRNSAVE.EXE", 0, winreg.REG_SZ,
+                                   str(SCREENSAVER_SCR_PATH.resolve()))
+                winreg.SetValueEx(key, "ScreenSaveActive", 0, winreg.REG_SZ, "1")
+                try:
+                    winreg.QueryValueEx(key, "ScreenSaveTimeOut")
+                except FileNotFoundError:
+                    winreg.SetValueEx(key, "ScreenSaveTimeOut", 0, winreg.REG_SZ, "600")
+        except OSError as e:
+            messagebox.showerror("Install failed", f"Could not write to the registry: {e}",
+                                  parent=self._ss_dialog)
+            return
+        self._ss_log("Installed as your Windows screen saver.")
+        self._ss_refresh_status()
+        messagebox.showinfo("Installed",
+                             "Flowing Curve Generator is now your Windows screen saver.\n\n"
+                             "Use \"Preview now\" above, or wait for it to trigger on its own, "
+                             "to see it -- and \"Open Windows Screen Saver Settings...\" below "
+                             "to change the wait time or see the live preview thumbnail.",
+                             parent=self._ss_dialog)
+
+    def _ss_turn_off(self):
+        if sys.platform != "win32":
+            return
+        try:
+            import winreg
+            with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, r"Control Panel\Desktop",
+                                     0, winreg.KEY_SET_VALUE) as key:
+                winreg.SetValueEx(key, "ScreenSaveActive", 0, winreg.REG_SZ, "0")
+        except OSError as e:
+            messagebox.showerror("Failed", f"Could not update the registry: {e}", parent=self._ss_dialog)
+            return
+        self._ss_log("Screen saver turned off (SCRNSAVE.EXE is left in place, so "
+                      "\"Install as screen saver\" turns it right back on).")
+        self._ss_refresh_status()
+
+    def _ss_open_settings(self):
+        if sys.platform != "win32":
+            return
+        try:
+            subprocess.Popen(["control.exe", "desk.cpl,,1"])
+        except OSError as e:
+            messagebox.showerror("Could not open Settings", str(e), parent=self._ss_dialog)
 
 
 if __name__ == "__main__":

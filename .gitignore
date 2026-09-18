@@ -28,3 +28,14 @@ wallpaper_regen*.request
 # reparenting on a real desktop -- not part of the shipped feature.
 wallpaper_live_test.bat
 wallpaper_live_test_log.txt
+
+# PyInstaller build output for the packaged screensaver (from
+# build_screensaver.bat, or the in-app "Screensaver..." dialog's Build
+# button -- see gui.py's _ss_start_build) -- dist/, build/, and the
+# generated .spec are all regenerable, and the built screensaver.scr
+# itself is a personal, per-machine artifact, not something to check in.
+dist/
+build/
+*.spec
+*.scr
+screensaver_debug.log
