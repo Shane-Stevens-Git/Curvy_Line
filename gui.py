@@ -48,6 +48,7 @@ import random
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import tkinter as tk
@@ -55,7 +56,7 @@ from datetime import date, datetime
 from pathlib import Path
 from tkinter import colorchooser, ttk, filedialog, messagebox
 
-from PIL import ImageTk
+from PIL import Image, ImageTk
 from shapely.geometry import Polygon as ShapelyPolygon
 
 from organic_curve import (generate, render_png, render_svg, render_svg_plotter, GenerationError,
@@ -74,6 +75,8 @@ OUTPUT_DIR = Path(__file__).parent / "outputs"
 WALLPAPER_ENGINE_PATH = Path(__file__).parent / "wallpaper_engine.py"
 SCREENSAVER_SCRIPT_PATH = Path(__file__).parent / "screensaver.py"
 SCREENSAVER_SCR_PATH = Path(__file__).parent / "screensaver.scr"
+APP_ICON_PNG_PATH = Path(__file__).parent / "assets" / "icon.png"
+APP_ICON_ICO_PATH = Path(__file__).parent / "assets" / "icon.ico"
 WALLPAPER_SHAPE_CHOICES = [s for s in FILL_SHAPES if s != "custom"]  # 'custom' needs a hand-drawn
                                                                        # region, not meaningful per-preset
 PREVIEW_BASENAME = "preview"
@@ -85,6 +88,7 @@ class CurveApp(tk.Tk):
         super().__init__()
         self.title("Flowing Curve Generator")
         self.minsize(880, 620)
+        self._set_app_icon()
 
         self.worker_queue = queue.Queue()
         self.busy = False
@@ -143,6 +147,24 @@ class CurveApp(tk.Tk):
 
         self._build_layout()
         self._poll_queue()
+
+    def _set_app_icon(self):
+        """Replaces Tk's own default icon (a little feather, on Windows)
+        with this app's -- assets/icon.png via iconphoto, which works the
+        same way on Windows/macOS/Linux, unlike iconbitmap which wants a
+        real Windows .ico specifically. Best-effort: a missing or corrupt
+        icon file just leaves Tk's default in place rather than stopping
+        the app from starting."""
+        try:
+            icon_img = Image.open(APP_ICON_PNG_PATH)
+            # Keep a reference on self -- Tk only holds a weak tie to a
+            # PhotoImage, so a local-variable-only image gets garbage
+            # collected and the icon silently reverts/blanks out the
+            # moment this method returns.
+            self._app_icon_photo = ImageTk.PhotoImage(icon_img)
+            self.iconphoto(True, self._app_icon_photo)
+        except Exception:
+            pass
 
     # ---------------------------------------------------------- layout ----
 
@@ -269,6 +291,10 @@ class CurveApp(tk.Tk):
 
         ttk.Label(parent, text="Flowing Curve Generator", font=("", 13, "bold")).grid(
             row=row, column=0, columnspan=2, sticky="w", pady=(0, 6))
+        row += 1
+        ttk.Button(parent, text="Create Desktop Shortcut...",
+                   command=self._create_desktop_shortcut).grid(
+            row=row, column=0, columnspan=2, sticky="ew", pady=(0, 10))
         row += 1
 
         # ================================================ before generate ====
@@ -2254,6 +2280,68 @@ class CurveApp(tk.Tk):
             subprocess.Popen(["control.exe", "desk.cpl,,1"])
         except OSError as e:
             messagebox.showerror("Could not open Settings", str(e), parent=self._ss_dialog)
+
+    # -------------------------------------------------- desktop shortcut ----
+
+    def _create_desktop_shortcut(self):
+        """Windows only. Adds a 'Flowing Curve Generator.lnk' shortcut to
+        the user's Desktop, targeting run.bat and using assets/icon.ico as
+        its icon (a plain .bat file would otherwise show a generic gear/
+        script icon there). Built via a small generated VBScript run
+        through cscript.exe -- WScript.Shell's CreateShortcut is the
+        standard way to create a real Windows .lnk without adding a
+        pywin32 dependency just for this."""
+        if sys.platform != "win32":
+            messagebox.showinfo("Windows only",
+                                 "Desktop shortcuts are a Windows-only concept -- "
+                                 "there's nothing to create here.")
+            return
+
+        project_dir = Path(__file__).resolve().parent
+        run_bat = project_dir / "run.bat"
+        icon_ico = APP_ICON_ICO_PATH
+        if not run_bat.exists():
+            messagebox.showerror("Not found", f"Could not find {run_bat}.")
+            return
+        if not icon_ico.exists():
+            messagebox.showerror("Not found", f"Could not find {icon_ico}.")
+            return
+
+        vbs = (
+            'Set oWS = WScript.CreateObject("WScript.Shell")\n'
+            'sLinkFile = oWS.SpecialFolders("Desktop") & "\\Flowing Curve Generator.lnk"\n'
+            'Set oLink = oWS.CreateShortcut(sLinkFile)\n'
+            f'oLink.TargetPath = "{run_bat}"\n'
+            f'oLink.WorkingDirectory = "{project_dir}"\n'
+            f'oLink.IconLocation = "{icon_ico}"\n'
+            'oLink.Description = "Flowing Curve Generator"\n'
+            'oLink.Save\n'
+        )
+        vbs_path = Path(tempfile.gettempdir()) / "fcg_make_shortcut.vbs"
+        try:
+            vbs_path.write_text(vbs)
+            result = subprocess.run(
+                ["cscript.exe", "//nologo", str(vbs_path)],
+                capture_output=True, text=True, timeout=15,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+        except (OSError, subprocess.TimeoutExpired) as e:
+            messagebox.showerror("Could not create shortcut", str(e))
+            return
+        finally:
+            try:
+                vbs_path.unlink()
+            except OSError:
+                pass
+
+        if result.returncode != 0:
+            messagebox.showerror("Could not create shortcut",
+                                  result.stderr.strip() or result.stdout.strip() or
+                                  f"cscript.exe exited with code {result.returncode}.")
+            return
+
+        messagebox.showinfo("Shortcut created",
+                             'Added "Flowing Curve Generator" to your Desktop.')
 
 
 if __name__ == "__main__":

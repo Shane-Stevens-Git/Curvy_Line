@@ -273,14 +273,17 @@
       <span class="badge">Desktop app (Tkinter)</span>
       <span class="badge">Windows / macOS / Linux</span>
       <span class="badge">Live wallpaper (Windows)</span>
+      <span class="badge">Screen saver (Windows)</span>
+      <span class="badge">Pen-plotter SVG export</span>
     </div>
     <h1>Flowing Curve Generator</h1>
     <p class="tagline">
       Draws a single, continuous, non-intersecting organic line that fills a shape
       edge to edge &mdash; like one long strand of string laid down by hand.
       Pick a shape (or draw your own), tune how it flows, and export it as a
-      PNG or SVG &mdash; or set the looping, color-blended "chasing lights"
-      version as an animated live wallpaper on Windows.
+      PNG, an SVG, or a pen-plotter-ready SVG in real-world millimeters &mdash;
+      or set the looping, color-blended "chasing lights" version as an animated
+      live wallpaper or screen saver on Windows.
     </p>
     <img class="hero-shot" src="screenshots/gui-full-app.png" alt="Flowing Curve Generator desktop app, showing a completed curve fill next to the control sidebar">
   </div>
@@ -399,10 +402,22 @@
         printing, plotting, or use as a desktop/phone wallpaper.</p>
       </div>
       <div class="feature">
+        <h4>Pen-plotter export</h4>
+        <p>A separate "Export for pen plotter..." SVG, sized in real-world
+        millimeters to a page size you choose, with no filled background and an
+        optional corner start point &mdash; ready to send straight to a plotter.</p>
+      </div>
+      <div class="feature">
         <h4>Live wallpaper (Windows)</h4>
         <p>Runs the color-crawl animation as an actual desktop wallpaper in the
         background, rotating through a set of presets you configure &mdash; one new
-        look per day.</p>
+        look per day, throttled or paused automatically on battery power.</p>
+      </div>
+      <div class="feature">
+        <h4>Screen saver (Windows)</h4>
+        <p>The same rotation as a real Windows screen saver &mdash; fullscreen,
+        closes on any input, with a live preview thumbnail in Windows' own
+        Settings. Built, installed, and tried out entirely from the app itself.</p>
       </div>
     </div>
   </section>
@@ -443,6 +458,11 @@ pip install -r requirements.txt
 python gui.py</code></pre>
       </div>
     </div>
+
+    <p style="font-size:0.85rem;">On Windows, once it's running: <strong>Create Desktop
+    Shortcut...</strong> at the top of the app adds a "Flowing Curve Generator" shortcut
+    to your Desktop, pointing at <code>run.bat</code> and using the app's own icon
+    &mdash; a one-time click instead of finding/pinning <code>run.bat</code> by hand.</p>
   </section>
 
   <section id="usage">
@@ -531,6 +551,13 @@ python gui.py</code></pre>
         report alongside it) wherever you choose.</dd>
       </div>
       <div class="usage-block">
+        <dt>Export for pen plotter...</dt>
+        <dd>A separate SVG built for plotting rather than viewing: real-world
+        millimeter sizing to a page size you set (defaulting to the curve's own
+        aspect ratio), no filled background, and an option to start the path
+        near the top-left corner.</dd>
+      </div>
+      <div class="usage-block">
         <dt>Clear saved copies</dt>
         <dd>Empties the app's own <code>outputs/</code> working folder of anything
         you've saved there before &mdash; the current on-screen preview is kept.</dd>
@@ -569,11 +596,16 @@ python gui.py</code></pre>
       <li><strong>Display settings</strong> &mdash; background color, stroke width, and
       edge inset, shared across every preset.</li>
       <li><strong>Monitors</strong> &mdash; run on just the monitor the app is on, or
-      stretch the same pattern across all of them.</li>
+      stretch the same pattern across all of them, with an independent process (and
+      independent Start/Stop) per monitor.</li>
       <li><strong>Start Wallpaper Now / Stop Wallpaper</strong> &mdash; saves your
       changes and launches (or stops) <code>wallpaper_engine.py</code> as its own
       background process, so it survives closing the dialog, the app, or your sign-in
       session.</li>
+      <li><strong>Battery-aware throttling</strong> &mdash; on a laptop running on
+      battery, the animation automatically slows down, and pauses entirely below a
+      low-battery threshold, resuming at full speed the moment it's plugged back in.
+      On by default; a checkbox in this dialog turns it off.</li>
     </ul>
 
     <div class="callout" style="border-left-color: var(--accent-3); background: rgba(255, 89, 94, 0.08);">
@@ -593,6 +625,51 @@ python gui.py</code></pre>
       trick breaks input on some setups and see if it can be made safe, but for now
       the safe, click-friendly default is what ships.
     </div>
+  </section>
+
+  <section id="screensaver">
+    <h2>Screen saver (Windows)</h2>
+    <p class="lead">
+      <code>screensaver.py</code> packages the same color-crawl animation as a real
+      Windows <code>.scr</code> screen saver &mdash; fullscreen, closes on any mouse
+      movement, click, or keypress, and shows a live thumbnail preview in Windows'
+      own Screen Saver Settings dialog. It reads the exact same
+      <code>wallpaper_config.json</code> as the live wallpaper above (so they share
+      one set of presets), but never advances or saves the daily rotation itself
+      &mdash; it's a read-only viewer, so there's no chance of it and the live
+      wallpaper racing to roll over the same day's preset.
+    </p>
+
+    <h3>Building and installing it</h3>
+    <p>
+      Everything below is a button in the app's <strong>Screensaver...</strong>
+      dialog (next to <strong>Configure Wallpaper...</strong>) &mdash; no terminal,
+      no <code>.bat</code> file, nothing outside the GUI:
+    </p>
+    <ul class="list">
+      <li><strong>Preview now (fullscreen)</strong> &mdash; runs the real screen saver
+      full-screen immediately, straight off your current settings, without needing
+      to build or install anything first.</li>
+      <li><strong>Build .scr (PyInstaller)...</strong> &mdash; packages
+      <code>screensaver.py</code> into <code>screensaver.scr</code>, right next to
+      <code>gui.py</code>, streaming the build's progress into a log box in the
+      dialog. Takes a minute or two.</li>
+      <li><strong>Install as screen saver</strong> &mdash; sets it as your active
+      Windows screen saver (a couple of registry values under
+      <code>HKEY_CURRENT_USER</code>, no administrator rights needed).</li>
+      <li><strong>Turn off screen saver</strong> &mdash; switches your screen saver
+      back off without touching anything else, from the same dialog.</li>
+      <li><strong>Open Windows Screen Saver Settings...</strong> &mdash; jumps
+      straight to Windows' own dialog, for changing the idle wait time or checking
+      the live preview thumbnail.</li>
+    </ul>
+
+    <p style="font-size:0.85rem;">
+      Packaging has to happen on a real Windows machine (PyInstaller builds for
+      whatever OS it runs on) &mdash; <code>build_screensaver.bat</code> and
+      <code>install_screensaver.bat</code> are also included, doing the exact same
+      thing from a double-click, for anyone who'd rather not open the app first.
+    </p>
   </section>
 
   <section id="notes">
@@ -615,9 +692,12 @@ python gui.py</code></pre>
       <tr><td><code>organic_curve.py</code></td><td>The generation algorithm and PNG/SVG rendering &mdash; usable standalone from the command line, or imported by the GUI.</td></tr>
       <tr><td><code>gui.py</code></td><td>The desktop app (this is what <code>run.bat</code> / <code>run.sh</code> launch).</td></tr>
       <tr><td><code>wallpaper_engine.py</code></td><td>The background live-wallpaper process, launched by <strong>Start Wallpaper Now</strong> in <code>gui.py</code>'s <strong>Configure Wallpaper...</strong> dialog &mdash; Windows only.</td></tr>
+      <tr><td><code>screensaver.py</code></td><td>The screen saver &mdash; reuses <code>wallpaper_engine.py</code>'s generation/rendering, packaged as a standard Windows <code>.scr</code>. Built, installed, and previewed from <code>gui.py</code>'s <strong>Screensaver...</strong> dialog &mdash; Windows only.</td></tr>
       <tr><td><code>requirements.txt</code></td><td>Python dependencies (numpy, scipy, shapely, Pillow).</td></tr>
       <tr><td><code>run.bat</code> / <code>run.sh</code></td><td>One-click setup + launch, for Windows and macOS/Linux respectively &mdash; already in every clone.</td></tr>
       <tr><td><code>install.bat</code> / <code>install.sh</code></td><td>The standalone installer linked at the top of this page &mdash; downloads the whole project fresh, then hands off to <code>run.bat</code> / <code>run.sh</code> above.</td></tr>
+      <tr><td><code>build_screensaver.bat</code> / <code>install_screensaver.bat</code></td><td>A no-GUI fallback for packaging/installing the screen saver &mdash; the <strong>Screensaver...</strong> dialog above does the same thing with a button instead.</td></tr>
+      <tr><td><code>assets/</code></td><td>The app's own icon (<code>icon.png</code> for the window/taskbar icon, <code>icon.ico</code> for the <strong>Create Desktop Shortcut...</strong> button's shortcut).</td></tr>
       <tr><td><code>outputs/</code></td><td>Where the app writes the current preview and anything saved with "Save As...".</td></tr>
       <tr><td><code>wallpaper_config.json</code></td><td>Your saved wallpaper presets and settings &mdash; created on first use of <strong>Configure Wallpaper...</strong>, not part of the source.</td></tr>
     </table>
