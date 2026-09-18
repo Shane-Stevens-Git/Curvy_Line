@@ -996,6 +996,60 @@ def _rect_overlap_area(a, b):
     return (right - left) * (bottom - top)
 
 
+def _reposition_child_to_target(hwnd, parent_hwnd, target_rect):
+    """(Re-)applies target_rect (an absolute (left, top, right, bottom)
+    screen rectangle) to hwnd, a child of parent_hwnd, via SetWindowPos --
+    same math reparent_behind_desktop_icons() uses right after SetParent:
+    SetWindowPos's x/y for a child window are relative to the *parent's*
+    on-screen origin, not the screen's, so this re-derives the correct
+    relative offset from parent_hwnd's own current GetWindowRect every
+    time it's called, rather than assuming a fixed offset that could go
+    stale if the parent itself ever moves.
+
+    Why this is a standalone, callable-more-than-once function and not
+    just inlined at the one call site in reparent_behind_desktop_icons():
+    real-hardware testing (a user picking different monitors in gui.py's
+    per-monitor selection, all landing on the same physical screen) found
+    that Explorer silently resets a freshly-reparented child's position
+    back to some other placement a few seconds after the initial
+    SetParent+SetWindowPos -- confirmed via a debug-log timeline showing
+    the correct MonitorFromWindow() result immediately after attach, then
+    the wrong one from the very next periodic health-check tick onward,
+    with nothing in this codebase having touched the window's position in
+    between. It only seems to happen once, not continuously (the position
+    stayed put, just on the wrong monitor, for the rest of a multi-minute
+    test run) -- so periodically *re-asserting* the intended position
+    (see tick()'s reparent-health watchdog) wins that race without this
+    code needing to know why Explorer does it.
+
+    Returns True if SetWindowPos reported success, False if target_rect
+    wasn't given or parent_hwnd's rect couldn't be read."""
+    if target_rect is None:
+        return False
+    parent_rect = _get_window_rect(parent_hwnd)
+    if not parent_rect:
+        return False
+    from ctypes import wintypes
+    user32 = ctypes.windll.user32
+    user32.SetWindowPos.restype = wintypes.BOOL
+    user32.SetWindowPos.argtypes = [
+        wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
+        ctypes.c_int, ctypes.c_int, wintypes.UINT,
+    ]
+    rel_x = target_rect[0] - parent_rect[0]
+    rel_y = target_rect[1] - parent_rect[1]
+    want_w = target_rect[2] - target_rect[0]
+    want_h = target_rect[3] - target_rect[1]
+    SWP_NOZORDER = 0x0004
+    SWP_NOACTIVATE = 0x0010
+    ok = user32.SetWindowPos(hwnd, None, rel_x, rel_y, want_w, want_h,
+                              SWP_NOZORDER | SWP_NOACTIVATE)
+    _debug_log(f"reposition: SetWindowPos(hwnd={hwnd}, parent={parent_hwnd}, "
+               f"rel_x={rel_x}, rel_y={rel_y}, w={want_w}, h={want_h}) -> ok={ok}, "
+               f"rect_after={_get_window_rect(hwnd)}")
+    return bool(ok)
+
+
 def reparent_behind_desktop_icons(hwnd, target_rect=None):
     """The WorkerW trick: ask Progman to spawn a WorkerW window behind the
     desktop icons (undocumented but stable since Windows 7/8, used by every
@@ -1184,22 +1238,7 @@ def reparent_behind_desktop_icons(hwnd, target_rect=None):
     if target_rect is not None:
         parent_rect = _get_window_rect(target_workerw)
         if parent_rect:
-            user32.SetWindowPos.restype = wintypes.BOOL
-            user32.SetWindowPos.argtypes = [
-                wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
-                ctypes.c_int, ctypes.c_int, wintypes.UINT,
-            ]
-            rel_x = target_rect[0] - parent_rect[0]
-            rel_y = target_rect[1] - parent_rect[1]
-            want_w = target_rect[2] - target_rect[0]
-            want_h = target_rect[3] - target_rect[1]
-            SWP_NOZORDER = 0x0004
-            SWP_NOACTIVATE = 0x0010
-            ok = user32.SetWindowPos(hwnd, None, rel_x, rel_y, want_w, want_h,
-                                      SWP_NOZORDER | SWP_NOACTIVATE)
-            _debug_log(f"reparent: SetWindowPos(rel_x={rel_x}, rel_y={rel_y}, "
-                       f"w={want_w}, h={want_h}) -> ok={ok}, "
-                       f"rect_after_reposition={_get_window_rect(hwnd)}")
+            _reposition_child_to_target(hwnd, target_workerw, target_rect)
 
             # A user report that picking different monitors kept landing
             # the wallpaper on the same physical screen, despite this
@@ -1520,7 +1559,21 @@ class WallpaperWindow:
         re-reparent (reparent_behind_desktop_icons is idempotent -- it
         looks for an existing candidate WorkerW before asking Progman to
         spawn a new one) and falls back to lower() if that fails too, the
-        same safety net __init__ uses on first startup."""
+        same safety net __init__ uses on first startup.
+
+        Even when parentage is still correct, real-hardware testing found
+        Explorer will silently reset our *position within* that parent a
+        few seconds after a correct initial SetParent+SetWindowPos --
+        with no corresponding SetParent/SetWindowPos logged from this
+        codebase and no parentage change either, so the check above alone
+        never notices. It only seems to happen once (not continuously),
+        so on every 'still attached' tick this also re-derives where we
+        should currently be (self._reparent_target_rect) and compares it
+        against where GetWindowRect says we actually are; if they've
+        drifted apart, it re-asserts the correct position via
+        _reposition_child_to_target the same way the initial reparent
+        does. This is a no-op (skipped entirely) once nothing has
+        drifted, so it doesn't spam the debug log every 5 seconds."""
         if sys.platform != "win32" or self._worker_hwnd is None:
             return
         try:
@@ -1535,7 +1588,19 @@ class WallpaperWindow:
             current_parent = user32.GetParent(self._root_hwnd)
             _log_window_monitor_state(self._root_hwnd, "reparent-health-tick")
             if still_valid and current_parent == self._worker_hwnd:
-                return  # still attached exactly where we left it -- nothing to do
+                if self._reparent_target_rect is not None:
+                    current_rect = _get_window_rect(self._root_hwnd)
+                    if current_rect != self._reparent_target_rect:
+                        _debug_log(
+                            f"reparent-health: parent is still correct "
+                            f"({self._worker_hwnd}) but position has drifted -- "
+                            f"current_rect={current_rect}, "
+                            f"target_rect={self._reparent_target_rect}. Explorer "
+                            f"likely reset it after attach; re-asserting position.")
+                        _reposition_child_to_target(
+                            self._root_hwnd, self._worker_hwnd,
+                            self._reparent_target_rect)
+                return  # still attached (and now correctly positioned)
 
             _debug_log(f"reparent-health: lost -- worker_hwnd={self._worker_hwnd} "
                        f"still_valid={still_valid}, current_parent={current_parent} "
