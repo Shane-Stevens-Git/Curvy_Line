@@ -237,6 +237,36 @@ def _enum_own_top_level_windows():
     return hwnds
 
 
+def _log_window_monitor_state(hwnd, tag):
+    """Diagnostic-only: logs hwnd's current on-screen rect (GetWindowRect)
+    and which physical monitor Windows currently associates it with
+    (MonitorFromWindow), tagged with `tag`. Added after a user report that
+    picking different monitors in gui.py's per-monitor selection kept
+    landing the wallpaper on the same physical screen, even though the
+    reparenting code's own rect math and immediate rect_after_reposition
+    check both looked correct at the time -- this exists to catch a
+    *later* silent shift (something moving or re-clipping the window
+    after the fact) that a one-time check right after SetWindowPos
+    wouldn't see. Called from tick()'s existing reparent-health watchdog
+    so a real-hardware run leaves a timeline of this across the whole
+    session, not just at startup."""
+    if sys.platform != "win32" or not hwnd:
+        return
+    try:
+        from ctypes import wintypes
+        user32 = ctypes.windll.user32
+        MONITOR_DEFAULTTONEAREST = 2
+        user32.MonitorFromWindow.restype = ctypes.c_void_p
+        user32.MonitorFromWindow.argtypes = [wintypes.HWND, wintypes.DWORD]
+        mon = user32.MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST)
+        rect = _get_window_rect(hwnd)
+        _debug_log(f"window-monitor-state[{tag}]: hwnd={hwnd} rect={rect} "
+                   f"MonitorFromWindow={mon} -- cross-reference against "
+                   f"enumerate_monitors()'s logged hmonitor values.")
+    except Exception as exc:  # noqa: BLE001 -- diagnostic only
+        _debug_log(f"window-monitor-state[{tag}]: FAILED: {exc!r}")
+
+
 def _log_foreground_state(hwnd, tag):
     """Diagnostic-only: logs which window Windows currently considers the
     foreground window (GetForegroundWindow) and which window on *our own*
@@ -643,6 +673,11 @@ def enumerate_monitors():
             found.append({
                 "left": r.left, "top": r.top, "right": r.right, "bottom": r.bottom,
                 "is_primary": bool(info.dwFlags & MONITORINFOF_PRIMARY),
+                # Raw HMONITOR value, kept only so a debug log can cross-
+                # reference this entry against a later MonitorFromWindow()
+                # result (see reparent_behind_desktop_icons) -- not
+                # otherwise used by any caller.
+                "hmonitor": hmonitor,
             })
         return True
 
@@ -654,9 +689,11 @@ def enumerate_monitors():
     if not found:
         w = user32.GetSystemMetrics(0)  # SM_CXSCREEN
         h = user32.GetSystemMetrics(1)  # SM_CYSCREEN
-        found = [{"left": 0, "top": 0, "right": w, "bottom": h, "is_primary": True}]
+        found = [{"left": 0, "top": 0, "right": w, "bottom": h, "is_primary": True, "hmonitor": None}]
 
     found.sort(key=lambda m: (m["left"], m["top"]))
+    _debug_log(f"enumerate_monitors: found {len(found)} monitor(s) after sorting "
+               f"left-to-right/top-to-bottom: {found}")
     return found
 
 
@@ -1163,6 +1200,48 @@ def reparent_behind_desktop_icons(hwnd, target_rect=None):
             _debug_log(f"reparent: SetWindowPos(rel_x={rel_x}, rel_y={rel_y}, "
                        f"w={want_w}, h={want_h}) -> ok={ok}, "
                        f"rect_after_reposition={_get_window_rect(hwnd)}")
+
+            # A user report that picking different monitors kept landing
+            # the wallpaper on the same physical screen, despite this
+            # rel_x/rel_y math and rect_after_reposition above both looking
+            # correct -- meaning GetWindowRect *claims* the right screen
+            # coordinates, but that's not the same as confirming Windows
+            # is actually painting there. MonitorFromWindow asks the OS
+            # directly which physical monitor a window is associated with
+            # right now, independent of any rect math; GetClientRect +
+            # ClientToScreen cross-checks whether the parent's *client*
+            # origin (what a child's x/y in SetWindowPos is really
+            # relative to) actually matches parent_rect's top-left (from
+            # GetWindowRect, what rel_x/rel_y above were computed against)
+            # -- if those two origins differ, this rel_x/rel_y math was
+            # anchored to the wrong point from the start.
+            try:
+                MONITOR_DEFAULTTONEAREST = 2
+                user32.MonitorFromWindow.restype = ctypes.c_void_p
+                user32.MonitorFromWindow.argtypes = [wintypes.HWND, wintypes.DWORD]
+                mon_for_us = user32.MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST)
+                mon_for_parent = user32.MonitorFromWindow(target_workerw, MONITOR_DEFAULTTONEAREST)
+
+                user32.GetClientRect.restype = wintypes.BOOL
+                user32.GetClientRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+                user32.ClientToScreen.restype = wintypes.BOOL
+                user32.ClientToScreen.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.POINT)]
+                client_rect = wintypes.RECT()
+                user32.GetClientRect(target_workerw, ctypes.byref(client_rect))
+                origin = wintypes.POINT(client_rect.left, client_rect.top)
+                user32.ClientToScreen(target_workerw, ctypes.byref(origin))
+
+                _debug_log(
+                    f"reparent: MonitorFromWindow(our hwnd)={mon_for_us}, "
+                    f"MonitorFromWindow(parent WorkerW)={mon_for_parent} -- cross-reference "
+                    f"these against enumerate_monitors()'s logged hmonitor values to see which "
+                    f"physical monitor Windows itself thinks we actually ended up on. Parent's "
+                    f"client-area screen origin (GetClientRect+ClientToScreen)="
+                    f"({origin.x},{origin.y}) vs parent_rect top-left (GetWindowRect)="
+                    f"({parent_rect[0]},{parent_rect[1]}) -- if these differ, rel_x/rel_y "
+                    f"above were computed against the wrong origin.")
+            except Exception as exc:  # noqa: BLE001 -- diagnostic only, must never crash
+                _debug_log(f"reparent: MonitorFromWindow/GetClientRect diagnostics FAILED: {exc!r}")
     return target_workerw
 
 
@@ -1454,6 +1533,7 @@ class WallpaperWindow:
 
             still_valid = bool(user32.IsWindow(self._worker_hwnd))
             current_parent = user32.GetParent(self._root_hwnd)
+            _log_window_monitor_state(self._root_hwnd, "reparent-health-tick")
             if still_valid and current_parent == self._worker_hwnd:
                 return  # still attached exactly where we left it -- nothing to do
 
