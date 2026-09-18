@@ -1306,6 +1306,68 @@ def _reposition_child_to_target(hwnd, parent_hwnd, target_rect):
     return bool(ok)
 
 
+# Remembers, for the "Progman-hosted" layout below, which Progman and which
+# SHELLDLL_DefView (the desktop-icons layer) we attached behind, so the
+# reparent-health watchdog in WallpaperWindow can re-assert our z-order.
+# Empty/None means the classic top-level-WorkerW attach was used instead.
+_PROGMAN_ATTACH = {"progman": None, "shell_view": None}
+
+
+def _log_progman_children(progman, label):
+    """Diagnostic only: logs Progman's direct child windows from the top of
+    the z-order down (class, visibility, screen rect). This is the picture
+    needed to debug the newer Windows 11 desktop layout without access to
+    the machine, so it is logged before and after attaching. Never raises."""
+    try:
+        from ctypes import wintypes
+        user32 = ctypes.windll.user32
+        user32.GetWindow.restype = wintypes.HWND
+        user32.GetWindow.argtypes = [wintypes.HWND, wintypes.UINT]
+        user32.IsWindowVisible.restype = wintypes.BOOL
+        user32.IsWindowVisible.argtypes = [wintypes.HWND]
+        GW_HWNDNEXT, GW_CHILD = 2, 5
+        rows = []
+        child = user32.GetWindow(progman, GW_CHILD)
+        while child and len(rows) < 30:
+            buf = ctypes.create_unicode_buffer(256)
+            user32.GetClassNameW(child, buf, 256)
+            rows.append(f"{child}:{buf.value!r} visible={bool(user32.IsWindowVisible(child))} "
+                        f"rect={_get_window_rect(child)}")
+            child = user32.GetWindow(child, GW_HWNDNEXT)
+        _debug_log(f"reparent[{label}]: Progman hwnd={progman} rect={_get_window_rect(progman)}; "
+                   f"children top-to-bottom of z-order: {rows}")
+    except Exception as exc:  # noqa: BLE001 -- diagnostic only, must never crash
+        _debug_log(f"reparent[{label}]: could not list Progman children: {exc!r}")
+
+
+def _place_behind_shellview(hwnd, shell_view):
+    """Puts hwnd (a child of Progman) directly behind shell_view (the
+    SHELLDLL_DefView desktop-icons layer) in Progman's child z-order, so it
+    is above anything Explorer keeps behind the icons (the wallpaper) but
+    below the icons. No move/resize/activate. Idempotent: does nothing if
+    hwnd already sits directly behind shell_view. Returns True if hwnd is
+    (now) directly behind shell_view."""
+    from ctypes import wintypes
+    user32 = ctypes.windll.user32
+    user32.GetWindow.restype = wintypes.HWND
+    user32.GetWindow.argtypes = [wintypes.HWND, wintypes.UINT]
+    user32.SetWindowPos.restype = wintypes.BOOL
+    user32.SetWindowPos.argtypes = [
+        wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
+        ctypes.c_int, ctypes.c_int, wintypes.UINT,
+    ]
+    GW_HWNDPREV = 3
+    if user32.GetWindow(hwnd, GW_HWNDPREV) == shell_view:
+        return True
+    SWP_NOSIZE, SWP_NOMOVE, SWP_NOACTIVATE = 0x0001, 0x0002, 0x0010
+    ok = user32.SetWindowPos(hwnd, shell_view, 0, 0, 0, 0,
+                             SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE)
+    now_prev = user32.GetWindow(hwnd, GW_HWNDPREV)
+    _debug_log(f"reparent: SetWindowPos z-order behind SHELLDLL_DefView={shell_view} "
+               f"-> ok={bool(ok)}, window directly above us is now {now_prev}")
+    return now_prev == shell_view
+
+
 def reparent_behind_desktop_icons(hwnd, target_rect=None):
     """The WorkerW trick: ask Progman to spawn a WorkerW window behind the
     desktop icons (undocumented but stable since Windows 7/8, used by every
@@ -1442,6 +1504,15 @@ def reparent_behind_desktop_icons(hwnd, target_rect=None):
         result = ctypes.c_void_p(0)
         user32.SendMessageTimeoutW(progman, 0x052C, 0, 0, 0x0, 1000, ctypes.byref(result))
         candidates, all_workerw_seen = _find_target_workerw()
+        # The new WorkerW can take a moment to appear after the message.
+        # Poll briefly (up to ~0.5s) before concluding there isn't one, so a
+        # slow-but-classic Windows doesn't get mistaken for the newer layout
+        # handled below.
+        for _ in range(5):
+            if candidates:
+                break
+            time.sleep(0.1)
+            candidates, all_workerw_seen = _find_target_workerw()
         _debug_log(f"reparent: no existing candidates, sent spawn message, "
                    f"now see {len(candidates)} candidate(s): {candidates}")
 
@@ -1450,7 +1521,54 @@ def reparent_behind_desktop_icons(hwnd, target_rect=None):
                f"chosen target_workerw={target_workerw}, matched_target_monitor={matched_target_monitor}")
 
     if not target_workerw:
-        return False
+        # Windows 11 24H2 and later (incl. 25H2) no longer spawn a top-level
+        # WorkerW beside the icons window. The icons layer (SHELLDLL_DefView)
+        # stays a direct child of Progman, and the wallpaper is hosted
+        # inside Progman too. So instead of a WorkerW, attach as a child of
+        # Progman and sit directly behind SHELLDLL_DefView in its z-order:
+        # above the wallpaper, below the icons. This branch only runs when
+        # the classic WorkerW search above found nothing, so Windows
+        # versions where the classic trick works are unaffected.
+        shell_view = user32.FindWindowExW(progman, None, "SHELLDLL_DefView", None)
+        _debug_log(f"reparent: no classic WorkerW target. SHELLDLL_DefView inside Progman={shell_view}")
+        if not shell_view:
+            return False
+        _log_progman_children(progman, "before-attach")
+        progman_rect = _get_window_rect(progman)
+        if target_rect is not None:
+            want_area = (target_rect[2] - target_rect[0]) * (target_rect[3] - target_rect[1])
+            have_area = _rect_overlap_area(progman_rect, target_rect)
+            if want_area <= 0 or have_area < want_area:
+                # A child is clipped to its parent, so attaching to a Progman
+                # that does not cover the target monitor would clip us to
+                # invisible. Same policy as the classic path: refuse cleanly
+                # and let the caller fall back to a normal window.
+                _debug_log(f"reparent: Progman rect={progman_rect} does not fully cover "
+                           f"target_rect={target_rect} (overlap {have_area} of {want_area}) -- "
+                           f"refusing to attach; falling back to a normal window.")
+                return False
+        rect_before = _get_window_rect(hwnd)
+        kernel32.SetLastError(0)
+        prev_parent = user32.SetParent(hwnd, progman)
+        if not prev_parent:
+            err = kernel32.GetLastError()
+            _debug_log(f"reparent: SetParent(Progman) FAILED, GetLastError={err}, "
+                       f"hwnd={hwnd}, rect_before={rect_before}")
+            return False
+        _debug_log(f"reparent: SetParent(Progman) OK, prev_parent={prev_parent}, "
+                   f"rect_before={rect_before}, rect_after={_get_window_rect(hwnd)}")
+        if target_rect is not None:
+            _reposition_child_to_target(hwnd, progman, target_rect)
+        in_place = _place_behind_shellview(hwnd, shell_view)
+        _PROGMAN_ATTACH["progman"] = progman
+        _PROGMAN_ATTACH["shell_view"] = shell_view
+        _log_progman_children(progman, "after-attach")
+        _debug_log(f"reparent: attached inside Progman behind the icons layer "
+                   f"(z-order in place={in_place}), rect={_get_window_rect(hwnd)}")
+        return progman
+
+    _PROGMAN_ATTACH["progman"] = None
+    _PROGMAN_ATTACH["shell_view"] = None
 
     if target_rect is not None and not matched_target_monitor:
         # We were asked to render on a specific monitor rectangle, but no
@@ -1882,6 +2000,12 @@ class WallpaperWindow:
                         _reposition_child_to_target(
                             self._root_hwnd, self._worker_hwnd,
                             self._reparent_target_rect)
+                # Progman-hosted layout only: keep us directly behind the
+                # icons layer if anything has reshuffled Progman's children.
+                shell_view = _PROGMAN_ATTACH.get("shell_view")
+                if (shell_view and _PROGMAN_ATTACH.get("progman") == self._worker_hwnd
+                        and user32.IsWindow(shell_view)):
+                    _place_behind_shellview(self._root_hwnd, shell_view)
                 return  # still attached (and now correctly positioned)
 
             _debug_log(f"reparent-health: lost -- worker_hwnd={self._worker_hwnd} "
