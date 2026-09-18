@@ -167,6 +167,76 @@ def _get_window_rect(hwnd):
     return (rect.left, rect.top, rect.right, rect.bottom)
 
 
+def _describe_hwnd(hwnd):
+    """Best-effort 'ClassName "Window Title"' string for hwnd, or a bare
+    fallback if either call fails -- diagnostic only, safe to call on a
+    window from any process (GetClassNameW/GetWindowTextW both work
+    cross-process). Used to turn a bare integer hwnd in the debug log into
+    something identifiable, e.g. distinguishing explorer.exe's taskbar
+    from one of our own process's own top-level windows."""
+    if sys.platform != "win32" or not hwnd:
+        return f"hwnd={hwnd}"
+    try:
+        user32 = ctypes.windll.user32
+        user32.GetClassNameW.restype = ctypes.c_int
+        user32.GetClassNameW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_int]
+        user32.GetWindowTextW.restype = ctypes.c_int
+        user32.GetWindowTextW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_int]
+        cls_buf = ctypes.create_unicode_buffer(256)
+        user32.GetClassNameW(hwnd, cls_buf, 256)
+        title_buf = ctypes.create_unicode_buffer(256)
+        user32.GetWindowTextW(hwnd, title_buf, 256)
+        return f"hwnd={hwnd} class={cls_buf.value!r} title={title_buf.value!r}"
+    except Exception as exc:  # noqa: BLE001 -- diagnostic only
+        return f"hwnd={hwnd} (describe failed: {exc!r})"
+
+
+def _enum_own_top_level_windows():
+    """Returns every top-level HWND currently owned by this process (via
+    EnumWindows + GetWindowThreadProcessId matched against os.getpid()).
+    Windows-only; [] elsewhere or on failure.
+
+    Why this exists: wallpaper_debug.log's new foreground heartbeat showed
+    that this window's own hardened root_hwnd is *never* the foreground
+    window across a full real-hardware run -- all our WS_EX_NOACTIVATE /
+    WM_MOUSEACTIVATE-swallowing / SetFocus(None) work on it is doing
+    exactly what it should. But a *different* hwnd, belonging to this same
+    process (confirmed by matching pid), repeatedly *does* become the
+    foreground window during that run -- and it's never been hardened at
+    all, because nothing in this codebase knew it existed until now. (It's
+    also the value SetParent returned as root_hwnd's *previous* parent
+    during reparenting, in reparent_behind_desktop_icons -- so it's very
+    likely a hidden top-level window Tk itself creates for its own
+    bookkeeping on Windows, not something wallpaper_engine.py created
+    on purpose.) Rather than hard-code that one hwnd, this enumerates
+    *every* top-level window this process owns, so __init__ can apply the
+    same input-safety treatment to all of them, including any others Tk
+    might create later that we still don't know about by name."""
+    if sys.platform != "win32":
+        return []
+    hwnds = []
+    try:
+        from ctypes import wintypes
+        user32 = ctypes.windll.user32
+        our_pid = os.getpid()
+
+        WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+        user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+
+        def _cb(hwnd, _lparam):
+            pid = wintypes.DWORD(0)
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            if pid.value == our_pid:
+                hwnds.append(hwnd)
+            return True
+
+        user32.EnumWindows(WNDENUMPROC(_cb), 0)
+    except Exception as exc:  # noqa: BLE001 -- best-effort, must never crash the wallpaper
+        _debug_log(f"enum-own-windows: FAILED: {exc!r}")
+    return hwnds
+
+
 def _log_foreground_state(hwnd, tag):
     """Diagnostic-only: logs which window Windows currently considers the
     foreground window (GetForegroundWindow) and which window on *our own*
@@ -219,7 +289,7 @@ def _log_foreground_state(hwnd, tag):
         )
         matches_hwnd = (" == our root_hwnd" if (hwnd and fg == hwnd)
                          else (" != our root_hwnd" if hwnd else ""))
-        _debug_log(f"heartbeat[{tag}]: foreground_hwnd={fg} ({fg_desc}{matches_hwnd}), "
+        _debug_log(f"heartbeat[{tag}]: foreground={_describe_hwnd(fg)} ({fg_desc}{matches_hwnd}), "
                    f"focus_hwnd_on_our_thread={focus}")
     except Exception as exc:  # noqa: BLE001 -- diagnostic only, must never crash
         _debug_log(f"heartbeat[{tag}]: FAILED: {exc!r}")
@@ -1064,6 +1134,19 @@ class WallpaperWindow:
         # if Tk's own subsequent setup calls end up triggering one.
         _install_activation_guard(root_hwnd)
 
+        # Two full rounds of hardening root_hwnd specifically did not stop
+        # the real-hardware freeze -- and the foreground/focus heartbeat
+        # added to chase that down showed why: root_hwnd was *never* the
+        # foreground window across a full test run, but a *different*
+        # top-level window belonging to this same process repeatedly was.
+        # Tk creates at least one hidden top-level window on Windows for
+        # its own bookkeeping that this code never knew about and had
+        # therefore never hardened -- it was actually visible all along as
+        # reparent_behind_desktop_icons()'s SetParent "prev_parent" value,
+        # we just hadn't connected the two. Rather than hard-code that one
+        # hwnd, harden every top-level window this process currently owns.
+        self._harden_own_windows("after-root-guard")
+
         monitor_mode = self.cfg.get("monitor_mode", "primary")
         if monitor_mode not in ("primary", "all"):
             monitor_mode = "primary"
@@ -1135,6 +1218,12 @@ class WallpaperWindow:
             self._worker_hwnd = reparented  # the actual WorkerW hwnd -- watched by tick()
             _debug_log(f"root rect after reparent={_get_window_rect(root_hwnd)}")
 
+        # Second hardening pass, in case Tk (or anything canvas/geometry
+        # setup touched above) created another own-process top-level
+        # window since the first pass -- belt and suspenders, same reason
+        # as the first call above.
+        self._harden_own_windows("after-reparent")
+
         # Finally make it visible -- everything above (geometry, the
         # input-safety styles, reparenting) is already in place, so there's
         # no gap where an unconfigured window could grab focus.
@@ -1146,6 +1235,34 @@ class WallpaperWindow:
         self._last_tick = time.time()
         self._spinner_angle = 0.0
         self._fg_heartbeat_due = time.time() + FOREGROUND_HEARTBEAT_INTERVAL
+
+    def _harden_own_windows(self, tag):
+        """Applies _make_input_safe()/_install_activation_guard() to every
+        top-level window this process currently owns, not just root_hwnd --
+        see the call site in __init__ for why. Tracks which hwnds it's
+        already hardened (self._hardened_hwnds) so a second call later in
+        __init__ doesn't redundantly re-subclass a wndproc it already
+        subclassed. Best-effort and diagnostic-heavy: logs every hwnd it
+        finds (with class/title, via _describe_hwnd) so the debug log shows
+        exactly what got hardened and when, even if this ends up not being
+        the whole story either."""
+        if sys.platform != "win32":
+            return
+        if not hasattr(self, "_hardened_hwnds"):
+            self._hardened_hwnds = set()
+        owned = _enum_own_top_level_windows()
+        _debug_log(f"harden-own-windows[{tag}]: process owns {len(owned)} top-level "
+                   f"window(s): {[_describe_hwnd(h) for h in owned]}")
+        for h in owned:
+            if h in self._hardened_hwnds:
+                continue
+            self._hardened_hwnds.add(h)
+            if h == self._root_hwnd:
+                continue  # already hardened directly, with its own logging, above
+            _debug_log(f"harden-own-windows[{tag}]: hardening previously-unseen "
+                       f"{_describe_hwnd(h)}")
+            _make_input_safe(h)
+            _install_activation_guard(h)
 
     def _start_generation(self):
         """Kick off generate() on a background thread for whichever
