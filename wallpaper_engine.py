@@ -453,6 +453,73 @@ REPARENT_SETTLE_DURATION = 4.0
 # land in the log without needing sub-second precision.
 FOREGROUND_HEARTBEAT_INTERVAL = 2.0
 
+# How often tick() re-checks AC/battery status via GetSystemPowerStatus
+# (seconds) -- see _refresh_power_status(). A laptop's power state changes
+# on the order of "user got up and unplugged it", not every frame, so
+# checking this occasionally rather than every tick costs nothing
+# noticeable while still reacting within a few seconds of unplugging (or
+# plugging back in).
+BATTERY_CHECK_INTERVAL = 15.0
+
+# The frame delay tick() uses instead of FRAME_MS while running on battery
+# (see cfg["battery_throttle_enabled"], default on). Still smooth enough
+# for a slow chase-light effect (~6-7fps) at a fraction of FRAME_MS's
+# CPU/GPU work -- multiple monitors can now each run their own instance
+# at once (see MONITOR_ARG), which multiplies this cost on a laptop, so
+# it's worth throttling even though a single instance alone was already
+# fairly cheap.
+BATTERY_THROTTLED_FRAME_MS = 150
+
+# Below this battery percentage (and unplugged), tick() stops redrawing
+# entirely -- freezing on whatever's already on screen -- rather than
+# just slowing down, since a laptop that's actually close to dying
+# shouldn't keep spending battery on a decorative animation at all. Not
+# exposed as a config knob (yet): a fixed, conservative default rather
+# than one more setting to explain in Configure Wallpaper.... Automatic
+# either direction -- resumes full-rate the moment AC power returns or
+# the percentage climbs back above this, no restart needed.
+BATTERY_PAUSE_PERCENT = 20.0
+
+
+class _SYSTEM_POWER_STATUS(ctypes.Structure):
+    """Mirrors Win32's SYSTEM_POWER_STATUS struct (GetSystemPowerStatus) --
+    only the two fields _get_power_status() actually reads (ACLineStatus,
+    BatteryLifePercent) matter here, but ctypes needs every field declared
+    in order so the struct's total size/layout matches what the API
+    writes into it."""
+    _fields_ = [
+        ("ACLineStatus", ctypes.c_ubyte),
+        ("BatteryFlag", ctypes.c_ubyte),
+        ("BatteryLifePercent", ctypes.c_ubyte),
+        ("SystemStatusFlag", ctypes.c_ubyte),
+        ("BatteryLifeTime", ctypes.c_ulong),
+        ("BatteryFullLifeTime", ctypes.c_ulong),
+    ]
+
+
+def _get_power_status():
+    """{'on_battery': bool, 'battery_percent': int 0-100 or None}. Best
+    effort: any failure (non-Windows, no battery present, the API call
+    itself failing) reports on_battery=False so a desktop with no battery
+    at all -- or any platform this can't query -- never throttles.
+    ACLineStatus==0 means running on battery (1 is AC power, 255 unknown --
+    treated as AC/not-throttled rather than guessing). BatteryLifePercent
+    of 255 means 'unknown' per the Win32 docs, reported here as None."""
+    if sys.platform != "win32":
+        return {"on_battery": False, "battery_percent": None}
+    try:
+        status = _SYSTEM_POWER_STATUS()
+        ok = ctypes.windll.kernel32.GetSystemPowerStatus(ctypes.byref(status))
+        if not ok:
+            return {"on_battery": False, "battery_percent": None}
+        percent = status.BatteryLifePercent
+        return {
+            "on_battery": status.ACLineStatus == 0,
+            "battery_percent": None if percent == 255 else percent,
+        }
+    except Exception:  # noqa: BLE001 -- best-effort diagnostic, must never crash the daemon
+        return {"on_battery": False, "battery_percent": None}
+
 # fill_shape is 'square' for every default preset -- for a wallpaper (unlike
 # the GUI's boxed preview) the whole point is to cover the monitor
 # edge-to-edge, and 'square' is the shape that means "the whole inset
@@ -535,6 +602,14 @@ DEFAULT_CONFIG = {
     # "rendered behind your icons" look but is not known to freeze
     # anything.
     "attempt_worker_reparent": True,
+    # On by default -- see BATTERY_CHECK_INTERVAL/BATTERY_THROTTLED_FRAME_MS/
+    # BATTERY_PAUSE_PERCENT and _refresh_power_status(). A live wallpaper
+    # running all day on a laptop's battery is exactly the kind of
+    # decorative background cost this should quietly reduce without the
+    # user having to think about it; the checkbox in Configure Wallpaper...
+    # is there for the rare case someone actually wants full-rate
+    # animation regardless of power source.
+    "battery_throttle_enabled": True,
     "presets": DEFAULT_PRESETS,
     "rotation_index": 0,
     "last_update": None,
@@ -1650,6 +1725,17 @@ class WallpaperWindow:
         self._spinner_angle = 0.0
         self._fg_heartbeat_due = time.time() + FOREGROUND_HEARTBEAT_INTERVAL
 
+        # See _refresh_power_status()/BATTERY_CHECK_INTERVAL. Checked for
+        # the first time on the very next tick() (due time 0.0, i.e.
+        # already due) rather than waiting a full BATTERY_CHECK_INTERVAL
+        # after startup, so a laptop that's already unplugged and low
+        # starts throttled immediately instead of animating at full rate
+        # for the first several seconds.
+        self._on_battery = False
+        self._battery_percent = None
+        self._battery_paused = False
+        self._battery_check_due = 0.0
+
     def _harden_own_windows(self, tag):
         """Applies _make_input_safe()/_install_activation_guard() to every
         top-level window this process currently owns, not just root_hwnd --
@@ -1811,6 +1897,38 @@ class WallpaperWindow:
         except Exception as exc:  # noqa: BLE001 -- a watchdog must never itself crash the wallpaper
             _debug_log(f"reparent-health: check FAILED: {exc!r}")
 
+    def _refresh_power_status(self):
+        """Called periodically from tick() (see BATTERY_CHECK_INTERVAL).
+        Updates self._on_battery/_battery_percent/_battery_paused from
+        GetSystemPowerStatus (see _get_power_status()), which tick()'s
+        frame-scheduling and redraw-skipping read every frame -- cheap
+        attribute reads, all the actual Win32 API cost is paid only here,
+        every BATTERY_CHECK_INTERVAL seconds. Disabling
+        cfg["battery_throttle_enabled"] snaps straight back to full-rate,
+        unpaused, regardless of what the last real reading was, so
+        unchecking the box in Configure Wallpaper... takes effect on this
+        engine's very next tick rather than waiting for the next battery
+        check to notice."""
+        if not bool(self.cfg.get("battery_throttle_enabled", True)):
+            if self._on_battery or self._battery_paused:
+                _debug_log("battery: throttling disabled in config -- resuming full rate.")
+            self._on_battery = False
+            self._battery_percent = None
+            self._battery_paused = False
+            return
+        status = _get_power_status()
+        on_battery = status["on_battery"]
+        percent = status["battery_percent"]
+        pause_threshold = max(0.0, min(100.0, float(self.cfg.get("battery_pause_percent", BATTERY_PAUSE_PERCENT))))
+        should_pause = on_battery and percent is not None and percent <= pause_threshold
+        if on_battery != self._on_battery or should_pause != self._battery_paused:
+            _debug_log(f"battery: on_battery={on_battery}, percent={percent}, "
+                       f"paused={should_pause} (was on_battery={self._on_battery}, "
+                       f"paused={self._battery_paused})")
+        self._on_battery = on_battery
+        self._battery_percent = percent
+        self._battery_paused = should_pause
+
     def _draw_spinner(self, cx, cy, radius, width, color="#ffffff"):
         """A simple rotating-arc loading spinner, drawn fresh each tick at
         self._spinner_angle (advanced in tick()). Used both for the
@@ -1858,12 +1976,25 @@ class WallpaperWindow:
         if now >= getattr(self, "_fg_heartbeat_due", 0):
             self._fg_heartbeat_due = now + FOREGROUND_HEARTBEAT_INTERVAL
             _log_foreground_state(self._root_hwnd, "heartbeat")
+        if now >= getattr(self, "_battery_check_due", 0):
+            self._battery_check_due = now + BATTERY_CHECK_INTERVAL
+            self._refresh_power_status()
         dt = max(0.0, min(0.25, now - self._last_tick))  # clamp a stall/lag spike
         self._last_tick = now
         # 220 deg/sec is a brisk, clearly-spinning rate without being
         # distracting -- only matters visually while a spinner is actually
         # being drawn below, but cheap enough to just always advance.
         self._spinner_angle = (self._spinner_angle - 220.0 * dt) % 360.0
+
+        # Below BATTERY_PAUSE_PERCENT and unplugged (see
+        # _refresh_power_status()), skip the redraw entirely this tick --
+        # whatever's already on screen just stays there -- instead of
+        # spending canvas/GPU work on an animation nobody's watching
+        # closely while the laptop is trying to conserve its last bit of
+        # charge. Automatically resumes the moment power status changes.
+        if self._battery_paused:
+            self.root.after(BATTERY_THROTTLED_FRAME_MS, self.tick)
+            return
 
         self.canvas.delete("all")
         if self.path is not None:
@@ -1929,7 +2060,11 @@ class WallpaperWindow:
             spin_cy = (text_bbox[1] + text_bbox[3]) / 2
             self._draw_spinner(spin_cx, spin_cy, spin_radius, max(2.0, 2.5 * self.display_scale))
 
-        self.root.after(FRAME_MS, self.tick)
+        # Slower (but still redrawing) while on battery and above
+        # BATTERY_PAUSE_PERCENT -- see _refresh_power_status() and the
+        # fully-paused early return above.
+        frame_ms = BATTERY_THROTTLED_FRAME_MS if self._on_battery else FRAME_MS
+        self.root.after(frame_ms, self.tick)
 
     def run(self, test_seconds=None):
         self._start_generation()  # kick off the very first curve

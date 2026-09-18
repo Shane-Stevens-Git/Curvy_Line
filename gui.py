@@ -58,7 +58,7 @@ from tkinter import colorchooser, ttk, filedialog, messagebox
 from PIL import ImageTk
 from shapely.geometry import Polygon as ShapelyPolygon
 
-from organic_curve import (generate, render_png, render_svg, GenerationError,
+from organic_curve import (generate, render_png, render_svg, render_svg_plotter, GenerationError,
                             max_safe_render_stroke, fill_polygon, FILL_SHAPES, crawl_bands,
                             build_gradient_palette)
 from wallpaper_engine import (load_config as load_wallpaper_config,
@@ -480,6 +480,10 @@ class CurveApp(tk.Tk):
         self.save_btn = ttk.Button(parent, text="Save As...", command=self._save_as, state="disabled")
         self.save_btn.grid(row=row, column=0, columnspan=2, sticky="ew", pady=(8, 4))
         row += 1
+        self.plotter_btn = ttk.Button(parent, text="Export for pen plotter...",
+                                       command=self._export_plotter, state="disabled")
+        self.plotter_btn.grid(row=row, column=0, columnspan=2, sticky="ew", pady=(0, 4))
+        row += 1
         ttk.Button(parent, text="Clear saved copies", command=self._clear_outputs).grid(
             row=row, column=0, columnspan=2, sticky="ew")
         row += 1
@@ -574,6 +578,7 @@ class CurveApp(tk.Tk):
         self.last_path = None
         self.last_report = None
         self.save_btn.config(state="disabled")
+        self.plotter_btn.config(state="disabled")
         self.replay_btn.config(state="disabled")
         self.crawl_btn.config(state="disabled")
         self.display_stroke_scale.config(state="disabled")
@@ -728,6 +733,7 @@ class CurveApp(tk.Tk):
         self.last_path = None
         self.last_report = None
         self.save_btn.config(state="disabled")
+        self.plotter_btn.config(state="disabled")
         self.replay_btn.config(state="disabled")
         self.crawl_btn.config(state="disabled")
         self.display_stroke_scale.config(state="disabled")
@@ -797,6 +803,7 @@ class CurveApp(tk.Tk):
         self._anim_skip = False
         self.generate_btn.config(state="disabled")
         self.save_btn.config(state="disabled")
+        self.plotter_btn.config(state="disabled")
         self.replay_btn.config(state="disabled")
         self.crawl_btn.config(state="disabled")
         self.skip_btn.config(state="disabled")
@@ -859,6 +866,7 @@ class CurveApp(tk.Tk):
         self.busy = False
         self.generate_btn.config(state="normal")
         self.save_btn.config(state="normal")
+        self.plotter_btn.config(state="normal")
         self.replay_btn.config(state="normal")
         self.crawl_btn.config(state="normal")
         self.progress.config(value=100)
@@ -1012,7 +1020,9 @@ class CurveApp(tk.Tk):
         self._crawl_last_tick = time.time()
         self.crawl_btn.config(text="Stop crawl")
         self.replay_btn.config(state="disabled")
-        self.save_btn.config(state="disabled")  # "Save As" saves the static render, not a crawl frame
+        # "Save As"/plotter export both save the static render, not a crawl frame
+        self.save_btn.config(state="disabled")
+        self.plotter_btn.config(state="disabled")
         self._crawl_tick(self._crawl_token)
 
     def _stop_crawl(self, restore=True):
@@ -1027,6 +1037,7 @@ class CurveApp(tk.Tk):
         if self.last_path is not None and not self.busy:
             self.replay_btn.config(state="normal")
             self.save_btn.config(state="normal")
+            self.plotter_btn.config(state="normal")
         if restore and was_running and self._last_static_img is not None:
             self._show_preview(self._last_static_img)
 
@@ -1188,6 +1199,100 @@ class CurveApp(tk.Tk):
             messagebox.showerror("Save failed", str(e))
             return
         self.status_var.set(f"Saved to {dest.name}")
+
+    def _export_plotter(self):
+        """Opens a small dialog collecting a physical page size (mm) and
+        whether to start the path near a corner, then writes a pen-plotter
+        SVG via render_svg_plotter() (see its docstring for why this isn't
+        just render_svg() with different units -- no fill anywhere, and
+        stroke width carried over in the same scale as the geometry so the
+        ink-gap safety margin from generation time still holds physically).
+        Uses the same path/stroke currently on screen (self.last_path,
+        self.last_stroke) as Save As does, so what's exported always
+        matches what's actually displayed."""
+        if self.last_path is None:
+            return
+
+        size = self.last_size
+        if isinstance(size, (tuple, list)):
+            gen_w, gen_h = float(size[0]), float(size[1])
+        else:
+            gen_w = gen_h = float(size)
+
+        # Default the page size to the same aspect ratio as the generated
+        # curve, scaled so its longer side is 200mm -- a reasonable
+        # starting point for a desktop plotter bed, easy to change below.
+        longest = max(gen_w, gen_h)
+        default_w = round(200.0 * gen_w / longest, 1)
+        default_h = round(200.0 * gen_h / longest, 1)
+
+        win = tk.Toplevel(self)
+        win.title("Export for pen plotter")
+        win.transient(self)
+        win.resizable(False, False)
+        pad = ttk.Frame(win, padding=12)
+        pad.grid(row=0, column=0, sticky="nsew")
+
+        ttk.Label(pad, text="Page size (mm)", font=("", 10, "bold")).grid(
+            row=0, column=0, columnspan=2, sticky="w")
+        ttk.Label(pad, text="Match the curve's own aspect ratio to avoid\n"
+                            "a letterboxed margin on one side.",
+                  foreground="#666").grid(row=1, column=0, columnspan=2, sticky="w", pady=(0, 6))
+
+        width_var = tk.StringVar(value=str(default_w))
+        height_var = tk.StringVar(value=str(default_h))
+        ttk.Label(pad, text="Width").grid(row=2, column=0, sticky="w")
+        ttk.Entry(pad, textvariable=width_var, width=10).grid(row=2, column=1, sticky="w", padx=(6, 0))
+        ttk.Label(pad, text="Height").grid(row=3, column=0, sticky="w", pady=(4, 0))
+        ttk.Entry(pad, textvariable=height_var, width=10).grid(
+            row=3, column=1, sticky="w", padx=(6, 0), pady=(4, 0))
+
+        corner_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(pad, text="Start path near the top-left corner",
+                         variable=corner_var).grid(row=4, column=0, columnspan=2, sticky="w", pady=(10, 0))
+        ttk.Label(pad, text="Useful if your plotter driver homes from a fixed\n"
+                            "start position. Off keeps the curve's original\n"
+                            "start point.",
+                  foreground="#666").grid(row=5, column=0, columnspan=2, sticky="w", pady=(0, 8))
+
+        def do_export():
+            try:
+                page_w = float(width_var.get())
+                page_h = float(height_var.get())
+                if page_w <= 0 or page_h <= 0:
+                    raise ValueError
+            except ValueError:
+                messagebox.showerror("Invalid size", "Width and height must be positive numbers.",
+                                      parent=win)
+                return
+            dest = filedialog.asksaveasfilename(
+                title="Export SVG for pen plotter...",
+                defaultextension=".svg",
+                filetypes=[("SVG image", "*.svg"), ("All files", "*.*")],
+                initialdir=str(OUTPUT_DIR),
+                initialfile=f"curve_seed{self.last_report['seed']}_plotter.svg",
+                parent=win,
+            )
+            if not dest:
+                return
+            svg_text = render_svg_plotter(
+                self.last_path, self.last_size, self.last_stroke,
+                page_width_mm=page_w, page_height_mm=page_h,
+                start_near_corner=corner_var.get(),
+            )
+            try:
+                Path(dest).write_text(svg_text, encoding="utf-8")
+            except OSError as e:
+                messagebox.showerror("Export failed", str(e), parent=win)
+                return
+            win.destroy()
+            self.status_var.set(f"Exported plotter SVG to {Path(dest).name}")
+
+        btn_row = ttk.Frame(pad)
+        btn_row.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+        ttk.Button(btn_row, text="Export...", command=do_export).pack(side="left", fill="x", expand=True)
+        ttk.Button(btn_row, text="Cancel", command=win.destroy).pack(
+            side="left", fill="x", expand=True, padx=(6, 0))
 
     def _clear_outputs(self):
         keep = {f"{PREVIEW_BASENAME}.png", f"{PREVIEW_BASENAME}.svg", f"{PREVIEW_BASENAME}.validation.json"}
@@ -1380,6 +1485,16 @@ class CurveApp(tk.Tk):
                             "ever stop responding, uncheck this box.",
                   foreground="#555555").grid(row=grow, column=0, columnspan=2, sticky="w", pady=(2, 4))
         grow += 1
+        self._wp_battery_var = tk.BooleanVar(value=bool(self._wp_cfg.get("battery_throttle_enabled", True)))
+        ttk.Checkbutton(globals_frame, text="Reduce animation on battery",
+                         variable=self._wp_battery_var, command=self._wp_battery_changed).grid(
+            row=grow, column=0, columnspan=2, sticky="w")
+        grow += 1
+        ttk.Label(globals_frame, text="On by default. Slows the crawl animation while on\n"
+                            "battery power, and pauses it entirely below 20% -- resumes\n"
+                            "full speed automatically once plugged back in.",
+                  foreground="#555555").grid(row=grow, column=0, columnspan=2, sticky="w", pady=(2, 4))
+        grow += 1
 
         # --- monitors: one independent Start/Stop row each, full width, below all 3 columns ---
         # Numbered per actual connected monitor (enumerate_wallpaper_monitors(),
@@ -1537,6 +1652,9 @@ class CurveApp(tk.Tk):
 
     def _wp_reparent_changed(self):
         self._wp_cfg["attempt_worker_reparent"] = bool(self._wp_reparent_var.get())
+
+    def _wp_battery_changed(self):
+        self._wp_cfg["battery_throttle_enabled"] = bool(self._wp_battery_var.get())
 
     def _wp_add_preset(self):
         base = WALLPAPER_DEFAULT_PRESETS[len(self._wp_cfg["presets"]) % len(WALLPAPER_DEFAULT_PRESETS)]

@@ -712,6 +712,71 @@ def render_svg(p, size, stroke, line_color='#111111', bg_color='#faf9f5'):
             f'stroke-linecap="round" stroke-linejoin="round"/></svg>')
 
 
+def render_svg_plotter(p, size, stroke, page_width_mm, page_height_mm,
+                        line_color='#000000', start_near_corner=False):
+    """Return SVG markup for the path in real-world millimeter units, meant
+    for pen-plotter software (AxiDraw's Inkscape-based workflow and
+    similar) rather than on-screen viewing. Pure function: no file I/O.
+
+    Two things make this different from render_svg(), both because a
+    physical pen -- unlike a screen -- can't fake a filled region by
+    lighting up pixels, it can only drag ink along the exact path it's
+    given:
+
+    - No fill anywhere, not even render_svg()'s background rect. A pen
+      plotter asked to "fill" a rectangle would just scribble the pen back
+      and forth across the whole page, which is never what's wanted here
+      -- the curve itself, traced once, is the entire plot.
+    - Real-world units: the SVG's viewBox/width/height are set in
+      millimeters (1 user unit = 1mm) instead of arbitrary pixels, since
+      plotter software maps the SVG straight onto the physical plot bed by
+      its stated size.
+
+    page_width_mm/page_height_mm should match size's own aspect ratio (the
+    same width:height proportion this path was generated at) -- scaling is
+    uniform (the same factor on both axes) rather than independent per
+    axis, so a mismatched aspect ratio leaves a centered margin on
+    whichever axis doesn't fill the page (letterboxing) instead of
+    stretching the organic curve out of shape.
+
+    stroke is still given in the *generation's own pixel units* (the same
+    value used at generation/validation time, e.g. via
+    max_safe_render_stroke) and converted to mm here using the same scale
+    factor as the geometry, so the minimum-ink-gap safety margin already
+    validated at generation time carries over correctly to the physical
+    plot instead of the caller needing to separately guess a safe mm
+    stroke width.
+
+    start_near_corner: the generated path is a single open curve, not a
+    closed loop (see generate()/render_png()'s end-cap circles), so it has
+    two distinct ends. If True, reverses it when that puts its starting
+    point closer to the page's top-left corner than its current start --
+    since some plotter drivers home from a fixed start position, a curve
+    that begins near a corner is easier to align by hand on the physical
+    page. A no-op, visually, either way -- it's the same curve either
+    direction -- so this only matters for where the pen starts down."""
+    width, height = _wh(size)
+    scale = min(page_width_mm / width, page_height_mm / height)
+    offset_x = (page_width_mm - width * scale) / 2.0
+    offset_y = (page_height_mm - height * scale) / 2.0
+
+    pts = p
+    if start_near_corner and len(pts) >= 2:
+        start_dist = pts[0][0] ** 2 + pts[0][1] ** 2
+        end_dist = pts[-1][0] ** 2 + pts[-1][1] ** 2
+        if end_dist < start_dist:
+            pts = pts[::-1]
+
+    d = 'M ' + ' L '.join(
+        f'{offset_x + x * scale:.4f},{offset_y + y * scale:.4f}' for x, y in pts)
+    stroke_mm = stroke * scale
+    w, h = _fmt_dim(page_width_mm), _fmt_dim(page_height_mm)
+    return (f'<svg xmlns="http://www.w3.org/2000/svg" '
+            f'viewBox="0 0 {w} {h}" width="{w}mm" height="{h}mm">'
+            f'<path d="{d}" fill="none" stroke="{line_color}" stroke-width="{stroke_mm:.4f}" '
+            f'stroke-linecap="round" stroke-linejoin="round"/></svg>')
+
+
 def max_safe_render_stroke(report, generation_stroke, margin=0.5):
     """The largest stroke width render_png/render_svg can use for this
     already-generated path without the line visually touching itself.
