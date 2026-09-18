@@ -375,35 +375,36 @@ DEFAULT_CONFIG = {
     # _virtual_screen_bounds() -- a real gui.py toggle for this is coming,
     # for now edit this value directly in wallpaper_config.json.
     "monitor_mode": "primary",
-    # Off by default: the WorkerW "behind the desktop icons" reparenting
-    # trick attaches this window as a child of a window owned by
-    # explorer.exe (a different process) -- an unusual, poorly-documented
-    # operation that was confirmed, via extensive testing on a real
-    # 2-monitor machine, to cause the monitor the GUI is on to stop
-    # accepting *any* clicks (including the taskbar and unrelated apps)
-    # until the GUI was minimized. The working theory was a focus/
-    # activation conflict between gui.py's window and this one, and two
-    # layers now specifically target that: _make_input_safe() (extended
-    # window styles: never activatable, click-through) and, new since
-    # that didn't get re-verified live, _install_activation_guard() (a
-    # message-level WM_MOUSEACTIVATE swallow plus activation-message
-    # logging, so a repro would actually leave a trace in
-    # wallpaper_debug.log instead of just "it froze again"). Both apply
-    # unconditionally, whether or not this setting is even on. tick() also
-    # now watches that the reparent stays valid (see REPARENT_CHECK_INTERVAL)
-    # and quietly recovers if Explorer restarts and orphans it.
+    # On by default as of 2026-09-18: the WorkerW "behind the desktop
+    # icons" reparenting trick attaches this window as a child of a window
+    # owned by explorer.exe (a different process) -- an unusual, poorly-
+    # documented operation that, for a long stretch of this project, caused
+    # the monitor the GUI is on to stop accepting *any* clicks (including
+    # the taskbar and unrelated apps) until the GUI was minimized.
     #
-    # None of that has been confirmed against the original freeze on real
-    # hardware yet, though -- it's a well-reasoned first attempt, not a
-    # verified fix. Still off by default until it's actually been tried
-    # again on the machine that reproduced it. Disabling it uses a plain
-    # positioned/lowered/click-through window instead, which loses the
-    # "rendered behind your icons" look (icons are visually covered while
-    # it runs, though clicks should still reach them) but is not known to
-    # freeze anything. Turn this on from the "Configure Wallpaper..."
-    # dialog to test the new mitigations -- gui.py's checkbox for this
-    # explains what's changed and what to watch for.
-    "attempt_worker_reparent": False,
+    # Root cause, confirmed via a foreground/focus heartbeat added to
+    # wallpaper_debug.log specifically to chase this down: it was never
+    # about this window itself -- _make_input_safe()'s extended styles and
+    # _install_activation_guard()'s message-level guard on root_hwnd were
+    # both working correctly the whole time. The real culprit was a
+    # *second*, hidden top-level window Tk itself creates on Windows for
+    # its own bookkeeping, which this code didn't know existed and had
+    # therefore never hardened -- it was repeatedly grabbing the
+    # foreground and freezing input, unrelated to anything about root_hwnd
+    # or the reparenting itself. _harden_own_windows() now enumerates and
+    # hardens *every* top-level window this process owns, not just the one
+    # we knew about by name, and that's what actually fixed it -- confirmed
+    # on the real 2-monitor machine that reproduced the freeze for months:
+    # no freeze, running behind the icons as intended.
+    #
+    # tick() still watches that the reparent stays valid (see
+    # REPARENT_CHECK_INTERVAL) and quietly recovers if Explorer restarts
+    # and orphans it. If this ever does misbehave on some other Windows
+    # setup, turning it back off from "Configure Wallpaper..." falls back
+    # to a plain positioned/lowered/click-through window -- it loses the
+    # "rendered behind your icons" look but is not known to freeze
+    # anything.
+    "attempt_worker_reparent": True,
     "presets": DEFAULT_PRESETS,
     "rotation_index": 0,
     "last_update": None,
@@ -1184,7 +1185,7 @@ class WallpaperWindow:
         self._worker_hwnd = None  # set below if reparenting succeeds; watched by tick()
         self._reparent_target_rect = target_rect
         self._reparent_check_due = time.time() + REPARENT_CHECK_INTERVAL
-        attempt_reparent = bool(self.cfg.get("attempt_worker_reparent", False))
+        attempt_reparent = bool(self.cfg.get("attempt_worker_reparent", True))
         if attempt_reparent:
             reparented = reparent_behind_desktop_icons(root_hwnd, target_rect=target_rect)
         else:

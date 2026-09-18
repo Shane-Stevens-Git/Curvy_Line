@@ -102,9 +102,10 @@ following install.bat/install.sh's existing pattern, but worth doing
 hands-on on the real machine rather than blind; and it should skip the
 WorkerW desktop-icon reparenting trick (`attempt_worker_reparent`)
 entirely — a screensaver is expected to cover the whole screen on top of
-everything, which sidesteps the current wallpaper's core headache (that
-reparenting-behind-icons is exactly what caused the click-freeze bug that
-made "render behind desktop icons" default off in Configure Wallpaper...).
+everything, which sidesteps the reparenting-behind-icons trick that used to
+cause the live wallpaper's click-freeze bug (fixed 2026-09-18 -- see
+wallpaper_engine.py's `_harden_own_windows()`; it's on by default in
+Configure Wallpaper... now).
 Worth calling out: since a screensaver only shows while the user's away,
 it doesn't need input passthrough or click-safety at all — so it's
 legitimately a simpler window to get right than the live wallpaper, not
