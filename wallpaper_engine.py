@@ -167,6 +167,64 @@ def _get_window_rect(hwnd):
     return (rect.left, rect.top, rect.right, rect.bottom)
 
 
+def _log_foreground_state(hwnd, tag):
+    """Diagnostic-only: logs which window Windows currently considers the
+    foreground window (GetForegroundWindow) and which window on *our own*
+    thread currently holds keyboard focus (GetFocus), tagged with `tag` so
+    the debug log can be grepped for a timeline of these across a run.
+
+    Why this exists: two rounds of fixes aimed squarely at this window
+    (WS_EX_NOACTIVATE, swallowing WM_MOUSEACTIVATE, explicit SetFocus(None)
+    both proactive and reactive to WM_SETFOCUS) have not stopped the
+    real-hardware freeze. The freeze's own signature doesn't point at a
+    hung process either -- the wallpaper keeps animating the whole time --
+    and the only known fix once frozen is minimizing gui.py's own window,
+    which works whether or not gui.py was already minimized *before* the
+    freeze started. That's consistent with the OS's global foreground-
+    window pointer getting stuck on something related to this reparented
+    window (or this process) and only releasing when another window is
+    forced to take the foreground -- but every guard so far only sees
+    messages sent *to this window specifically*, and the last real-
+    hardware log went completely silent right after reparenting, with none
+    of those messages ever firing again. If the stuck state isn't
+    delivered as a message to this window at all, watching for messages
+    can never see it.
+
+    This periodic heartbeat asks the OS directly, on a timer, regardless
+    of whether this window's own wndproc ever gets called again. Comparing
+    GetWindowThreadProcessId(foreground_hwnd) against our own pid tells us
+    whether the foreground window belongs to this process at all (as
+    opposed to gui.py's separate process, explorer.exe, or something
+    else) -- the piece of evidence needed to confirm or rule out this
+    theory on the next real-hardware test."""
+    if sys.platform != "win32":
+        return
+    try:
+        from ctypes import wintypes
+        user32 = ctypes.windll.user32
+        user32.GetForegroundWindow.restype = ctypes.c_void_p
+        user32.GetFocus.restype = ctypes.c_void_p
+        user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+        user32.GetWindowThreadProcessId.argtypes = [ctypes.c_void_p, ctypes.POINTER(wintypes.DWORD)]
+
+        fg = user32.GetForegroundWindow()
+        fg_pid = wintypes.DWORD(0)
+        if fg:
+            user32.GetWindowThreadProcessId(fg, ctypes.byref(fg_pid))
+        our_pid = os.getpid()
+        focus = user32.GetFocus()
+        fg_desc = "none" if not fg else (
+            f"OUR PROCESS (pid={fg_pid.value})" if fg_pid.value == our_pid
+            else f"other process (pid={fg_pid.value})"
+        )
+        matches_hwnd = (" == our root_hwnd" if (hwnd and fg == hwnd)
+                         else (" != our root_hwnd" if hwnd else ""))
+        _debug_log(f"heartbeat[{tag}]: foreground_hwnd={fg} ({fg_desc}{matches_hwnd}), "
+                   f"focus_hwnd_on_our_thread={focus}")
+    except Exception as exc:  # noqa: BLE001 -- diagnostic only, must never crash
+        _debug_log(f"heartbeat[{tag}]: FAILED: {exc!r}")
+
+
 # Curves are generated at this resolution (on the long edge) no matter how
 # big the real screen is, then scaled up when drawing -- redrawing tens or
 # hundreds of thousands of points every frame at native 4K+ resolution
@@ -189,6 +247,14 @@ FRAME_MS = 50
 # cheap, have no reason to run 20 times a second for something that only
 # changes when Explorer itself restarts.
 REPARENT_CHECK_INTERVAL = 5.0
+
+# How often tick() logs a foreground/focus heartbeat (seconds) -- see
+# _log_foreground_state(). Diagnostic only, aimed at the click-freeze bug;
+# cheap enough (two GetForegroundWindow-class calls) to run this often
+# without mattering for CPU, and frequent enough that a ~2s bracket around
+# the moment a freeze starts (or is released by minimizing gui.py) should
+# land in the log without needing sub-second precision.
+FOREGROUND_HEARTBEAT_INTERVAL = 2.0
 
 # fill_shape is 'square' for every default preset -- for a wallpaper (unlike
 # the GUI's boxed preview) the whole point is to cover the monitor
@@ -633,11 +699,17 @@ def _install_activation_guard(hwnd):
         GWLP_WNDPROC = -4
         WM_MOUSEACTIVATE = 0x0021
         WM_ACTIVATE = 0x0006
+        WM_ACTIVATEAPP = 0x001C
         WM_NCACTIVATE = 0x0086
         WM_SETFOCUS = 0x0007
         WM_KILLFOCUS = 0x0008
         MA_NOACTIVATEANDEAT = 3
-        _LOGGED_MSGS = (WM_ACTIVATE, WM_NCACTIVATE, WM_SETFOCUS, WM_KILLFOCUS)
+        # WM_ACTIVATEAPP added this round: it fires when the foreground
+        # window switches *between two different processes/threads* (not
+        # just between windows of the same one), which WM_ACTIVATE alone
+        # doesn't distinguish -- exactly the kind of transition the
+        # foreground-heartbeat theory in _log_foreground_state() is about.
+        _LOGGED_MSGS = (WM_ACTIVATE, WM_ACTIVATEAPP, WM_NCACTIVATE, WM_SETFOCUS, WM_KILLFOCUS)
 
         user32 = ctypes.windll.user32
         LRESULT = ctypes.c_ssize_t
@@ -666,13 +738,16 @@ def _install_activation_guard(hwnd):
                 _debug_log(f"activation-guard: WM_MOUSEACTIVATE on hwnd={_hwnd} -- "
                            f"swallowing it (returning MA_NOACTIVATEANDEAT) so this "
                            f"click can never activate/focus this window.")
+                _log_foreground_state(_hwnd, "WM_MOUSEACTIVATE")
                 return MA_NOACTIVATEANDEAT
             if msg == WM_SETFOCUS:
                 _debug_log(f"activation-guard: WM_SETFOCUS on hwnd={_hwnd} (wparam={wparam:#x}, "
                            f"the window that HAD focus) -- this window should never hold "
                            f"real keyboard focus, handing it straight back via SetFocus(None).")
+                _log_foreground_state(_hwnd, "WM_SETFOCUS-before-release")
                 result = user32.CallWindowProcW(original, _hwnd, msg, wparam, lparam)
                 user32.SetFocus(None)
+                _log_foreground_state(_hwnd, "WM_SETFOCUS-after-release")
                 return result
             if msg in _LOGGED_MSGS:
                 _debug_log(f"activation-guard: hwnd={_hwnd} received msg={msg:#06x} "
@@ -1063,11 +1138,14 @@ class WallpaperWindow:
         # Finally make it visible -- everything above (geometry, the
         # input-safety styles, reparenting) is already in place, so there's
         # no gap where an unconfigured window could grab focus.
+        _log_foreground_state(root_hwnd, "before-deiconify")
         self.root.deiconify()
+        _log_foreground_state(root_hwnd, "after-deiconify")
 
         self._phase = 0.0
         self._last_tick = time.time()
         self._spinner_angle = 0.0
+        self._fg_heartbeat_due = time.time() + FOREGROUND_HEARTBEAT_INTERVAL
 
     def _start_generation(self):
         """Kick off generate() on a background thread for whichever
@@ -1205,6 +1283,9 @@ class WallpaperWindow:
         if now >= self._reparent_check_due:
             self._reparent_check_due = now + REPARENT_CHECK_INTERVAL
             self._check_reparent_health()
+        if now >= getattr(self, "_fg_heartbeat_due", 0):
+            self._fg_heartbeat_due = now + FOREGROUND_HEARTBEAT_INTERVAL
+            _log_foreground_state(self._root_hwnd, "heartbeat")
         dt = max(0.0, min(0.25, now - self._last_tick))  # clamp a stall/lag spike
         self._last_tick = now
         # 220 deg/sec is a brisk, clearly-spinning rate without being
