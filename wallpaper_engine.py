@@ -348,6 +348,22 @@ FRAME_MS = 50
 # changes when Explorer itself restarts.
 REPARENT_CHECK_INTERVAL = 5.0
 
+# Real-hardware testing of the position-drift fix (Explorer silently
+# resetting a freshly-reparented window's position a few seconds after
+# attach -- see _reposition_child_to_target()'s docstring) confirmed the
+# self-correction works, but riding the normal REPARENT_CHECK_INTERVAL
+# cadence for it meant waiting up to a full 5 seconds after startup (or
+# after a monitor switch) before the wallpaper snapped onto the right
+# screen -- noticeable and worth tightening up. The drift itself only
+# seems to happen once, shortly after a reparent, not continuously, so
+# rather than paying for a permanently faster health-check tick (which
+# would just burn cycles once nothing is drifting), tick() checks much
+# more often for a short window right after every successful reparent
+# (initial attach, or a recovery re-reparent after Explorer restarts),
+# then settles back down to the normal cadence once that window passes.
+REPARENT_SETTLE_INTERVAL = 0.4
+REPARENT_SETTLE_DURATION = 4.0
+
 # How often tick() logs a foreground/focus heartbeat (seconds) -- see
 # _log_foreground_state(). Diagnostic only, aimed at the click-freeze bug;
 # cheap enough (two GetForegroundWindow-class calls) to run this often
@@ -1414,6 +1430,7 @@ class WallpaperWindow:
         self._worker_hwnd = None  # set below if reparenting succeeds; watched by tick()
         self._reparent_target_rect = target_rect
         self._reparent_check_due = time.time() + REPARENT_CHECK_INTERVAL
+        self._reparent_settle_until = 0.0  # set below if reparenting succeeds
         attempt_reparent = bool(self.cfg.get("attempt_worker_reparent", True))
         if attempt_reparent:
             reparented = reparent_behind_desktop_icons(root_hwnd, target_rect=target_rect)
@@ -1446,6 +1463,8 @@ class WallpaperWindow:
                 pass
         else:
             self._worker_hwnd = reparented  # the actual WorkerW hwnd -- watched by tick()
+            self._reparent_settle_until = time.time() + REPARENT_SETTLE_DURATION
+            self._reparent_check_due = time.time() + REPARENT_SETTLE_INTERVAL
             _debug_log(f"root rect after reparent={_get_window_rect(root_hwnd)}")
 
         # Second hardening pass, in case Tk (or anything canvas/geometry
@@ -1610,6 +1629,11 @@ class WallpaperWindow:
                 self._root_hwnd, target_rect=self._reparent_target_rect)
             if new_worker:
                 self._worker_hwnd = new_worker
+                # A fresh reparent -- same position-drift risk as the
+                # initial one in __init__, so restart the fast-checking
+                # settle window rather than waiting up to
+                # REPARENT_CHECK_INTERVAL again.
+                self._reparent_settle_until = time.time() + REPARENT_SETTLE_DURATION
                 _debug_log(f"reparent-health: recovered, new worker_hwnd={new_worker}")
             else:
                 self._worker_hwnd = None
@@ -1655,7 +1679,16 @@ class WallpaperWindow:
 
         now = time.time()
         if now >= self._reparent_check_due:
-            self._reparent_check_due = now + REPARENT_CHECK_INTERVAL
+            # Right after a (re-)reparent, checks run at the much faster
+            # REPARENT_SETTLE_INTERVAL cadence for REPARENT_SETTLE_DURATION
+            # seconds, so the one-time Explorer position-reset gets caught
+            # and corrected in under a second instead of taking up to a
+            # full REPARENT_CHECK_INTERVAL -- see REPARENT_SETTLE_INTERVAL's
+            # comment. Falls back to the normal, cheaper cadence once that
+            # window has passed.
+            settling = now < getattr(self, "_reparent_settle_until", 0)
+            interval = REPARENT_SETTLE_INTERVAL if settling else REPARENT_CHECK_INTERVAL
+            self._reparent_check_due = now + interval
             self._check_reparent_health()
         if now >= getattr(self, "_fg_heartbeat_due", 0):
             self._fg_heartbeat_due = now + FOREGROUND_HEARTBEAT_INTERVAL
