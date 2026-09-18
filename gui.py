@@ -1374,19 +1374,9 @@ class CurveApp(tk.Tk):
                          variable=self._wp_reparent_var, command=self._wp_reparent_changed).grid(
             row=grow, column=0, columnspan=2, sticky="w")
         grow += 1
-        ttk.Label(globals_frame, text="On by default. This used to be able to freeze all\n"
-                            "clicks on the monitor the wallpaper was on until the\n"
-                            "wallpaper was closed -- traced to a hidden window Tk\n"
-                            "itself creates that wasn't being protected the same way\n"
-                            "as the main wallpaper window, fixed by locking down every\n"
-                            "window this app owns rather than just the one we knew\n"
-                            "about. Confirmed clean on real hardware. If clicks ever do\n"
-                            "stop responding on that monitor: try your other monitor\n"
-                            "or Ctrl+Shift+Esc for Task Manager to end\n"
-                            "wallpaper_engine.py, then send the wallpaper_debug.log\n"
-                            "file from this folder. Turning it off instead sits the\n"
-                            "wallpaper on top of your icons -- clicks still reach\n"
-                            "them, you just can't see them to aim.",
+        ttk.Label(globals_frame, text="On by default. This used to cause a click-freeze bug\n"
+                            "on some machines, now fixed. If clicks on that monitor\n"
+                            "ever stop responding, uncheck this box.",
                   foreground="#555555").grid(row=grow, column=0, columnspan=2, sticky="w", pady=(2, 4))
         grow += 1
 
