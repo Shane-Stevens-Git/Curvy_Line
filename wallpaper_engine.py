@@ -150,7 +150,19 @@ def _parse_monitor_arg():
 
 MONITOR_ARG = _parse_monitor_arg()
 
-BASE_DIR = Path(__file__).parent
+# Path(__file__).parent is correct for the normal "python wallpaper_engine.py"
+# case, but breaks once this module is bundled by PyInstaller (as it is
+# inside the screensaver .scr build -- see build_screensaver.bat): __file__
+# then resolves to a throwaway extraction folder, not the real project
+# folder, so wallpaper_config.json/wallpaper_cache would silently be read
+# from (and, for the live engine, written to) the wrong place. When frozen,
+# fall back to the directory the executable itself lives in instead -- the
+# install docs keep the built .scr in the same folder as gui.py/
+# wallpaper_engine.py for exactly this reason.
+if getattr(sys, "frozen", False):
+    BASE_DIR = Path(sys.executable).resolve().parent
+else:
+    BASE_DIR = Path(__file__).resolve().parent
 
 
 def _path_suffix_for_monitor(monitor_key):
