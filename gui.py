@@ -292,10 +292,6 @@ class CurveApp(tk.Tk):
         ttk.Label(parent, text="Flowing Curve Generator", font=("", 13, "bold")).grid(
             row=row, column=0, columnspan=2, sticky="w", pady=(0, 6))
         row += 1
-        ttk.Button(parent, text="Create Desktop Shortcut...",
-                   command=self._create_desktop_shortcut).grid(
-            row=row, column=0, columnspan=2, sticky="ew", pady=(0, 10))
-        row += 1
 
         # ================================================ before generate ====
 
@@ -544,6 +540,18 @@ class CurveApp(tk.Tk):
         row += 1
         ttk.Label(parent, text="Windows only. Build and install the same\n"
                                "curves as your actual screen saver.",
+                  foreground="#666").grid(row=row, column=0, columnspan=2, sticky="w", pady=(2, 0))
+        row += 1
+
+        # --- Desktop shortcut (one-time setup, so it lives at the very ---
+        # bottom rather than competing with the generation controls above ---
+        # for attention every time the app opens) ---
+        ttk.Button(parent, text="Create Desktop Shortcut...",
+                   command=self._create_desktop_shortcut).grid(
+            row=row, column=0, columnspan=2, sticky="ew", pady=(14, 0))
+        row += 1
+        ttk.Label(parent, text="Windows only. Adds a shortcut to run.bat\n"
+                               "on your Desktop, using this app's icon.",
                   foreground="#666").grid(row=row, column=0, columnspan=2, sticky="w", pady=(2, 0))
         row += 1
 
