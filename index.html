@@ -420,6 +420,13 @@
         closes on any input, with a live preview thumbnail in Windows' own
         Settings. Built, installed, and tried out entirely from the app itself.</p>
       </div>
+      <div class="feature">
+        <h4>App icon &amp; Desktop shortcut (Windows)</h4>
+        <p>The app's own generated-curve icon replaces the default window icon, and
+        a one-click <strong>Create Desktop Shortcut...</strong> button (or a Y/N
+        prompt the first time you run <code>run.bat</code>) adds a "Flowing Curve
+        Generator" shortcut to your Desktop, using that same icon.</p>
+      </div>
     </div>
   </section>
 
@@ -582,7 +589,7 @@ python gui.py</code></pre>
         <img src="screenshots/gui-live-wallpaper-section.png" alt="The Color crawl and Live wallpaper controls in the main app sidebar, including the new Blend slider" style="border: 1px solid var(--border);">
       </div>
       <div>
-        <img src="screenshots/wallpaper-dialog.png" alt="The Configure Wallpaper dialog, showing daily preset rotation, per-preset colors and blend, display settings, monitor choice, and the experimental rendering toggle" style="border: 1px solid var(--border);">
+        <img src="screenshots/wallpaper-dialog.png" alt="The Configure Wallpaper dialog, showing daily preset rotation, per-preset colors and blend, display settings, monitor choice, the render-behind-icons checkbox, and the battery-throttling checkbox" style="border: 1px solid var(--border);">
       </div>
     </div>
 
@@ -610,22 +617,20 @@ python gui.py</code></pre>
       On by default; a checkbox in this dialog turns it off.</li>
     </ul>
 
-    <div class="callout" style="border-left-color: var(--accent-3); background: rgba(255, 89, 94, 0.08);">
-      <strong>Known issue &mdash; "Render behind desktop icons":</strong> Windows has a
-      well-known trick for placing a window behind your desktop icons (instead of on
-      top of them), and this app can attempt it. On testing, though, it turned out to
-      freeze all mouse clicks on whichever monitor the wallpaper's window was on
-      &mdash; including the taskbar and unrelated apps &mdash; until that window was
-      minimized. The root cause traces back to that specific Windows trick itself
-      (reparenting the window under a different process's window), not to anything
-      else that was tried and ruled out along the way (DPI handling, z-order, focus).
-      Because of that, it's an opt-in, off-by-default checkbox
-      (<strong>Render behind desktop icons (experimental)</strong>) rather than the
-      default behavior: left off (the default), the wallpaper sits on top of your
-      icons instead of behind them &mdash; they're visually covered while it runs, but
-      clicks still reach them. I plan to dig back into <em>why</em> that reparenting
-      trick breaks input on some setups and see if it can be made safe, but for now
-      the safe, click-friendly default is what ships.
+    <div class="callout">
+      <strong>Render behind desktop icons:</strong> Windows has a well-known trick
+      for placing a window behind your desktop icons instead of on top of them, and
+      this app uses it so the wallpaper doesn't visually cover your icons while it
+      runs. An earlier version of this had a bug: on some setups it froze mouse
+      clicks on whichever monitor the wallpaper was on, until that window was
+      minimized. The root cause turned out to be a second, hidden window that Tk
+      itself creates for its own bookkeeping &mdash; the fix hardens <em>every</em>
+      top-level window the app owns against the trick's side effects, not just the
+      one it already knew about. Confirmed fixed on the real multi-monitor machine
+      that reproduced the freeze for months: no more freeze, running cleanly behind
+      the icons. It's on by default now; the checkbox in this dialog is only there
+      if you'd rather turn it off and have the wallpaper sit on top of your icons
+      instead.
     </div>
   </section>
 
