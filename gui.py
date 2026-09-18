@@ -65,7 +65,8 @@ from wallpaper_engine import (load_config as load_wallpaper_config,
                                save_config as save_wallpaper_config,
                                DEFAULT_PRESETS as WALLPAPER_DEFAULT_PRESETS,
                                CACHE_DIR as WALLPAPER_CACHE_DIR,
-                               REGEN_REQUEST_PATH as WALLPAPER_REGEN_REQUEST_PATH)
+                               REGEN_REQUEST_PATH as WALLPAPER_REGEN_REQUEST_PATH,
+                               enumerate_monitors as enumerate_wallpaper_monitors)
 
 OUTPUT_DIR = Path(__file__).parent / "outputs"
 WALLPAPER_ENGINE_PATH = Path(__file__).parent / "wallpaper_engine.py"
@@ -1358,12 +1359,39 @@ class CurveApp(tk.Tk):
 
         ttk.Label(globals_frame, text="Monitors").grid(row=grow, column=0, columnspan=2, sticky="w", pady=(8, 0))
         grow += 1
-        self._wp_monitor_var = tk.StringVar(value=self._wp_cfg.get("monitor_mode", "primary"))
+        # Numbered per actual connected monitor (enumerate_wallpaper_monitors(),
+        # left-to-right/top-to-bottom) rather than a vague "this monitor
+        # only" tied to wherever gui.py happens to be -- so a specific
+        # monitor can be picked by number regardless of which one the app
+        # window is currently sitting on.
+        wp_monitors = enumerate_wallpaper_monitors()
+        saved_monitor_mode = self._wp_cfg.get("monitor_mode", "primary")
+        initial_monitor_mode = saved_monitor_mode
+        if initial_monitor_mode != "all":
+            try:
+                valid_index = 0 <= int(initial_monitor_mode) < len(wp_monitors)
+            except (TypeError, ValueError):
+                valid_index = False
+            if not valid_index:
+                # Legacy "primary", or a saved index that no longer maps to
+                # a connected monitor (unplugged/rearranged since it was
+                # picked) -- select whichever monitor is currently primary
+                # so the right radio button actually lights up, matching
+                # what _virtual_screen_bounds() itself falls back to.
+                primary_idx = next((i for i, m in enumerate(wp_monitors) if m.get("is_primary")), 0)
+                initial_monitor_mode = str(primary_idx)
+        self._wp_monitor_var = tk.StringVar(value=initial_monitor_mode)
         mon_row = ttk.Frame(globals_frame)
         mon_row.grid(row=grow, column=0, columnspan=2, sticky="w")
         grow += 1
-        ttk.Radiobutton(mon_row, text="This monitor only", value="primary", variable=self._wp_monitor_var,
-                         command=self._wp_monitor_changed).pack(anchor="w")
+        for mon_i, mon in enumerate(wp_monitors):
+            mon_w = mon["right"] - mon["left"]
+            mon_h = mon["bottom"] - mon["top"]
+            mon_label = f"Monitor {mon_i + 1} — {mon_w}x{mon_h}"
+            if mon.get("is_primary"):
+                mon_label += " (primary)"
+            ttk.Radiobutton(mon_row, text=mon_label, value=str(mon_i), variable=self._wp_monitor_var,
+                             command=self._wp_monitor_changed).pack(anchor="w")
         ttk.Radiobutton(mon_row, text="Stretch across all monitors", value="all", variable=self._wp_monitor_var,
                          command=self._wp_monitor_changed).pack(anchor="w")
 

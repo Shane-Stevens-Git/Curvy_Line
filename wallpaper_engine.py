@@ -370,10 +370,13 @@ DEFAULT_CONFIG = {
     # border, which is what a wallpaper needs but the GUI's boxed preview
     # doesn't.
     "edge": 4.0,
-    # 'primary' fills just your main monitor; 'all' stretches one curve
-    # across the combined bounding box of every monitor. See
-    # _virtual_screen_bounds() -- a real gui.py toggle for this is coming,
-    # for now edit this value directly in wallpaper_config.json.
+    # 'primary' fills whichever monitor Windows currently reports as your
+    # main one; 'all' stretches one curve across the combined bounding box
+    # of every monitor; a stringified index ('0', '1', ...) fills that one
+    # specific monitor from enumerate_monitors(), regardless of which one
+    # is "primary" -- gui.py's Configure Wallpaper dialog lists each
+    # connected monitor by number so this doesn't need hand-editing
+    # anymore. See _virtual_screen_bounds().
     "monitor_mode": "primary",
     # On by default as of 2026-09-18: the WorkerW "behind the desktop
     # icons" reparenting trick attaches this window as a child of a window
@@ -583,11 +586,96 @@ def load_or_generate_path(cfg, screen_w, screen_h):
 
 # --- Windows WorkerW desktop-icon-layer reparenting --------------------
 
-def _virtual_screen_bounds(fallback_root=None, monitor_mode="primary"):
-    """Screen bounds to cover, in one of two modes:
+def enumerate_monitors():
+    """Every currently connected monitor, as a list of dicts each shaped
+    {'left', 'top', 'right', 'bottom', 'is_primary'} (screen coordinates,
+    same space GetWindowRect/SetWindowPos use elsewhere in this file),
+    sorted left-to-right then top-to-bottom so "Monitor 1"/"Monitor 2"
+    numbering in gui.py's Configure Wallpaper dialog stays consistent
+    across runs as long as the physical arrangement itself doesn't
+    change -- it isn't guaranteed to match Windows' own Display Settings
+    numbering (that follows device enumeration order, not position), but
+    left-to-right is the ordering a person looking at their own desks
+    would expect.
 
-    'primary' (default) -- just the main monitor, via GetSystemMetrics'
-    SM_CXSCREEN/SM_CYSCREEN, origin (0, 0).
+    Windows-only, via EnumDisplayMonitors + GetMonitorInfoW. On any other
+    platform (testing only -- real multi-monitor selection only means
+    anything for the Windows-only reparenting trick anyway) returns a
+    single fake monitor sized to whatever display Tk already knows about,
+    so callers can iterate this list without special-casing non-Windows
+    everywhere. Always returns at least one entry -- even a real failure
+    to enumerate on Windows falls back to a single monitor sized from
+    SM_CXSCREEN/SM_CYSCREEN, since "no monitors" isn't an actionable
+    result for any caller of this function."""
+    if sys.platform != "win32":
+        return [{"left": 0, "top": 0, "right": 1920, "bottom": 1080, "is_primary": True}]
+
+    from ctypes import wintypes
+    user32 = ctypes.windll.user32
+
+    MONITORINFOF_PRIMARY = 0x1
+
+    class MONITORINFO(ctypes.Structure):
+        _fields_ = [
+            ("cbSize", wintypes.DWORD),
+            ("rcMonitor", wintypes.RECT),
+            ("rcWork", wintypes.RECT),
+            ("dwFlags", wintypes.DWORD),
+        ]
+
+    HMONITOR = ctypes.c_void_p
+    HDC = ctypes.c_void_p
+    MonitorEnumProc = ctypes.WINFUNCTYPE(
+        wintypes.BOOL, HMONITOR, HDC, ctypes.POINTER(wintypes.RECT), wintypes.LPARAM)
+
+    user32.GetMonitorInfoW.restype = wintypes.BOOL
+    user32.GetMonitorInfoW.argtypes = [HMONITOR, ctypes.POINTER(MONITORINFO)]
+    user32.EnumDisplayMonitors.restype = wintypes.BOOL
+    user32.EnumDisplayMonitors.argtypes = [HDC, ctypes.POINTER(wintypes.RECT), MonitorEnumProc, wintypes.LPARAM]
+
+    found = []
+
+    def _cb(hmonitor, _hdc, _rect_ptr, _lparam):
+        info = MONITORINFO()
+        info.cbSize = ctypes.sizeof(MONITORINFO)
+        if user32.GetMonitorInfoW(hmonitor, ctypes.byref(info)):
+            r = info.rcMonitor
+            found.append({
+                "left": r.left, "top": r.top, "right": r.right, "bottom": r.bottom,
+                "is_primary": bool(info.dwFlags & MONITORINFOF_PRIMARY),
+            })
+        return True
+
+    try:
+        user32.EnumDisplayMonitors(None, None, MonitorEnumProc(_cb), 0)
+    except Exception as exc:  # noqa: BLE001 -- best-effort, always fall back below
+        _debug_log(f"enumerate_monitors: EnumDisplayMonitors FAILED: {exc!r}")
+
+    if not found:
+        w = user32.GetSystemMetrics(0)  # SM_CXSCREEN
+        h = user32.GetSystemMetrics(1)  # SM_CYSCREEN
+        found = [{"left": 0, "top": 0, "right": w, "bottom": h, "is_primary": True}]
+
+    found.sort(key=lambda m: (m["left"], m["top"]))
+    return found
+
+
+def _is_monitor_index(value):
+    """True if value looks like a stringified non-negative integer (e.g.
+    '0', '1') -- the per-monitor-selection form of monitor_mode, as
+    opposed to the 'primary'/'all' keywords. Doesn't check it against
+    enumerate_monitors() (that's _virtual_screen_bounds()'s job, since
+    only it knows whether that index is still in range) -- this just
+    validates the *shape* of the value, so config validation elsewhere
+    doesn't need to know the encoding."""
+    try:
+        return int(value) >= 0
+    except (TypeError, ValueError):
+        return False
+
+
+def _virtual_screen_bounds(fallback_root=None, monitor_mode="primary"):
+    """Screen bounds to cover. monitor_mode is one of:
 
     'all' -- every monitor combined, via SM_XVIRTUALSCREEN/
     SM_YVIRTUALSCREEN/SM_C{X,Y}VIRTUALSCREEN, so a single curve is
@@ -595,6 +683,15 @@ def _virtual_screen_bounds(fallback_root=None, monitor_mode="primary"):
     (not the same as one wallpaper mirrored per monitor -- if your
     monitors differ in resolution or aspect ratio, "all" will look
     stretched rather than uniform on each screen).
+
+    a stringified integer ('0', '1', ...) -- that specific monitor from
+    enumerate_monitors(), in its stable left-to-right/top-to-bottom order.
+    This is what gui.py's per-monitor radio buttons write to config.
+
+    'primary' (default, and the fallback for a saved index that no longer
+    exists -- monitor unplugged or rearranged since it was picked) --
+    whichever monitor Windows currently reports as primary, via
+    enumerate_monitors()'s is_primary flag.
 
     ctypes.windll only exists on Windows, so on any other platform (used
     here only for testing the animation/rotation logic, since the
@@ -618,9 +715,23 @@ def _virtual_screen_bounds(fallback_root=None, monitor_mode="primary"):
         # fall through to primary-monitor metrics if the virtual-screen
         # ones came back empty, which shouldn't normally happen
 
-    w = user32.GetSystemMetrics(0)  # SM_CXSCREEN
-    h = user32.GetSystemMetrics(1)  # SM_CYSCREEN
-    return 0, 0, w, h
+    monitors = enumerate_monitors()
+    chosen = None
+    if monitor_mode not in ("primary", "all"):
+        try:
+            idx = int(monitor_mode)
+        except (TypeError, ValueError):
+            idx = -1
+        if 0 <= idx < len(monitors):
+            chosen = monitors[idx]
+    if chosen is None:
+        # 'primary', or an index that no longer maps to a connected
+        # monitor -- fall back to whichever one Windows currently reports
+        # as primary (monitors is never empty, see enumerate_monitors()).
+        chosen = next((m for m in monitors if m["is_primary"]), monitors[0])
+
+    return (chosen["left"], chosen["top"],
+            chosen["right"] - chosen["left"], chosen["bottom"] - chosen["top"])
 
 
 def _make_input_safe(hwnd):
@@ -1149,7 +1260,7 @@ class WallpaperWindow:
         self._harden_own_windows("after-root-guard")
 
         monitor_mode = self.cfg.get("monitor_mode", "primary")
-        if monitor_mode not in ("primary", "all"):
+        if monitor_mode not in ("primary", "all") and not _is_monitor_index(monitor_mode):
             monitor_mode = "primary"
         self.x, self.y, self.w, self.h = _virtual_screen_bounds(self.root, monitor_mode)
         if sys.platform == "win32":
