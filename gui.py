@@ -65,7 +65,9 @@ from wallpaper_engine import (load_config as load_wallpaper_config,
                                save_config as save_wallpaper_config,
                                DEFAULT_PRESETS as WALLPAPER_DEFAULT_PRESETS,
                                CACHE_DIR as WALLPAPER_CACHE_DIR,
-                               REGEN_REQUEST_PATH as WALLPAPER_REGEN_REQUEST_PATH,
+                               regen_request_path_for_monitor as wallpaper_regen_request_path,
+                               lock_pid_for_monitor as wallpaper_lock_pid_for_monitor,
+                               terminate_pid as wallpaper_terminate_pid,
                                enumerate_monitors as enumerate_wallpaper_monitors)
 
 OUTPUT_DIR = Path(__file__).parent / "outputs"
@@ -108,13 +110,21 @@ class CurveApp(tk.Tk):
         self._last_static_img = None  # the most recent crisp (non-animating) render, to restore on Stop
 
         # Live wallpaper dialog/process state (see _open_wallpaper_dialog).
-        # Kept at the app level, not the dialog, so a running wallpaper
-        # process and its status stay tracked even if the dialog is closed
-        # and reopened -- the wallpaper itself is meant to outlive both the
-        # dialog and this whole app once started.
+        # Kept at the app level, not the dialog, so running wallpaper
+        # processes and their status stay tracked even if the dialog is
+        # closed and reopened -- each one is meant to outlive both the
+        # dialog and this whole app once started. Keyed by monitor (the
+        # same string passed as wallpaper_engine.py's '--monitor <key>' --
+        # a connected-monitor index like "0"/"1", or "all"), since more
+        # than one can now run at once, one per monitor -- see
+        # _build_wallpaper_dialog's per-row Start/Stop controls. Only
+        # tracks processes *this* CurveApp session actually started; a
+        # process from an earlier session (still running because it's
+        # designed to outlive gui.py closing) has no entry here, but
+        # still shows up correctly via _wp_row_status's lock-file fallback
+        # (see wallpaper_lock_pid_for_monitor).
         self._wallpaper_dialog = None
-        self._wallpaper_proc = None
-        self._wallpaper_status_var = tk.StringVar(value="Not running")
+        self._wallpaper_procs = {}
 
         OUTPUT_DIR.mkdir(exist_ok=True)
 
@@ -1215,6 +1225,7 @@ class CurveApp(tk.Tk):
 
         self._build_wallpaper_dialog(win)
         self._wp_update_run_buttons()
+        self._wp_poll_process()  # keeps every row's status live while the dialog stays open
 
     def _close_wallpaper_dialog(self):
         if json.dumps(self._wp_cfg, sort_keys=True) != self._wp_saved_snapshot:
@@ -1357,44 +1368,6 @@ class CurveApp(tk.Tk):
                   foreground="#666").grid(row=grow, column=0, columnspan=2, sticky="w", pady=(0, 4))
         grow += 1
 
-        ttk.Label(globals_frame, text="Monitors").grid(row=grow, column=0, columnspan=2, sticky="w", pady=(8, 0))
-        grow += 1
-        # Numbered per actual connected monitor (enumerate_wallpaper_monitors(),
-        # left-to-right/top-to-bottom) rather than a vague "this monitor
-        # only" tied to wherever gui.py happens to be -- so a specific
-        # monitor can be picked by number regardless of which one the app
-        # window is currently sitting on.
-        wp_monitors = enumerate_wallpaper_monitors()
-        saved_monitor_mode = self._wp_cfg.get("monitor_mode", "primary")
-        initial_monitor_mode = saved_monitor_mode
-        if initial_monitor_mode != "all":
-            try:
-                valid_index = 0 <= int(initial_monitor_mode) < len(wp_monitors)
-            except (TypeError, ValueError):
-                valid_index = False
-            if not valid_index:
-                # Legacy "primary", or a saved index that no longer maps to
-                # a connected monitor (unplugged/rearranged since it was
-                # picked) -- select whichever monitor is currently primary
-                # so the right radio button actually lights up, matching
-                # what _virtual_screen_bounds() itself falls back to.
-                primary_idx = next((i for i, m in enumerate(wp_monitors) if m.get("is_primary")), 0)
-                initial_monitor_mode = str(primary_idx)
-        self._wp_monitor_var = tk.StringVar(value=initial_monitor_mode)
-        mon_row = ttk.Frame(globals_frame)
-        mon_row.grid(row=grow, column=0, columnspan=2, sticky="w")
-        grow += 1
-        for mon_i, mon in enumerate(wp_monitors):
-            mon_w = mon["right"] - mon["left"]
-            mon_h = mon["bottom"] - mon["top"]
-            mon_label = f"Monitor {mon_i + 1} — {mon_w}x{mon_h}"
-            if mon.get("is_primary"):
-                mon_label += " (primary)"
-            ttk.Radiobutton(mon_row, text=mon_label, value=str(mon_i), variable=self._wp_monitor_var,
-                             command=self._wp_monitor_changed).pack(anchor="w")
-        ttk.Radiobutton(mon_row, text="Stretch across all monitors", value="all", variable=self._wp_monitor_var,
-                         command=self._wp_monitor_changed).pack(anchor="w")
-
         ttk.Label(globals_frame, text="Rendering").grid(row=grow, column=0, columnspan=2, sticky="w", pady=(8, 0))
         grow += 1
         self._wp_reparent_var = tk.BooleanVar(value=bool(self._wp_cfg.get("attempt_worker_reparent", True)))
@@ -1408,27 +1381,62 @@ class CurveApp(tk.Tk):
                   foreground="#555555").grid(row=grow, column=0, columnspan=2, sticky="w", pady=(2, 4))
         grow += 1
 
-        # --- run controls (full width, below all 3 columns) ---
+        # --- monitors: one independent Start/Stop row each, full width, below all 3 columns ---
+        # Numbered per actual connected monitor (enumerate_wallpaper_monitors(),
+        # left-to-right/top-to-bottom) rather than a vague "this monitor
+        # only" tied to wherever gui.py happens to be -- so a specific
+        # monitor can be picked by number regardless of which one the app
+        # window is currently sitting on. Each row starts/stops its own
+        # wallpaper_engine.py instance (--monitor <key> -- see
+        # wallpaper_engine.py's module docstring) independently, so e.g.
+        # Monitor 1 and Monitor 2 can each be running at the same time --
+        # they share the same preset rotation/colors/etc. above, just
+        # render independently. "Stretch across all monitors" is its own
+        # row too, mutually exclusive with the per-monitor ones (see
+        # _wp_update_run_buttons) since both would otherwise cover the
+        # same screen area at once.
         ttk.Separator(pad, orient="horizontal").grid(row=1, column=0, columnspan=3, sticky="ew", pady=(14, 10))
         rrow = 2
-        status_row = ttk.Frame(pad)
-        status_row.grid(row=rrow, column=0, columnspan=3, sticky="ew")
+        ttk.Label(pad, text="Monitors", font=("", 10, "bold")).grid(
+            row=rrow, column=0, columnspan=3, sticky="w")
         rrow += 1
-        ttk.Label(status_row, text="Status:").pack(side="left")
-        ttk.Label(status_row, textvariable=self._wallpaper_status_var).pack(side="left", padx=(4, 0))
+        ttk.Label(pad, text="Each one starts/stops independently and keeps running even\n"
+                            "after you close this window or the app. \"Stretch across all\"\n"
+                            "and individual monitors are mutually exclusive.",
+                  foreground="#666").grid(row=rrow, column=0, columnspan=3, sticky="w", pady=(0, 6))
+        rrow += 1
 
-        run_row = ttk.Frame(pad)
-        run_row.grid(row=rrow, column=0, columnspan=3, sticky="ew", pady=(4, 0))
+        wp_monitors = enumerate_wallpaper_monitors()
+        self._wp_monitor_keys = [str(i) for i in range(len(wp_monitors))] + ["all"]
+        self._wp_row_status_vars = {}
+        self._wp_row_start_btns = {}
+        self._wp_row_stop_btns = {}
+
+        mon_table = ttk.Frame(pad)
+        mon_table.grid(row=rrow, column=0, columnspan=3, sticky="w")
         rrow += 1
-        self._wp_start_btn = ttk.Button(run_row, text="Start Wallpaper Now", command=self._wp_start)
-        self._wp_start_btn.pack(side="left", fill="x", expand=True)
-        self._wp_stop_btn = ttk.Button(run_row, text="Stop Wallpaper", command=self._wp_stop)
-        self._wp_stop_btn.pack(side="left", fill="x", expand=True, padx=(6, 0))
-        ttk.Label(pad, text="Starting saves your changes first, then runs\n"
-                            "wallpaper_engine.py in the background -- it keeps\n"
-                            "going even after you close this window or the app.",
-                  foreground="#666").grid(row=rrow, column=0, columnspan=3, sticky="w", pady=(4, 0))
-        rrow += 1
+
+        def build_monitor_row(r, key, label_text):
+            ttk.Label(mon_table, text=label_text, width=28).grid(row=r, column=0, sticky="w", pady=1)
+            status_var = tk.StringVar(value="Not running")
+            self._wp_row_status_vars[key] = status_var
+            ttk.Label(mon_table, textvariable=status_var, width=18, foreground="#666").grid(
+                row=r, column=1, sticky="w")
+            start_btn = ttk.Button(mon_table, text="Start", width=7, command=lambda k=key: self._wp_start(k))
+            start_btn.grid(row=r, column=2, padx=(2, 0))
+            self._wp_row_start_btns[key] = start_btn
+            stop_btn = ttk.Button(mon_table, text="Stop", width=7, command=lambda k=key: self._wp_stop(k))
+            stop_btn.grid(row=r, column=3, padx=(2, 0))
+            self._wp_row_stop_btns[key] = stop_btn
+
+        for mon_i, mon in enumerate(wp_monitors):
+            mon_w = mon["right"] - mon["left"]
+            mon_h = mon["bottom"] - mon["top"]
+            mon_label = f"Monitor {mon_i + 1} — {mon_w}x{mon_h}"
+            if mon.get("is_primary"):
+                mon_label += " (primary)"
+            build_monitor_row(mon_i, str(mon_i), mon_label)
+        build_monitor_row(len(wp_monitors), "all", "Stretch across all monitors")
 
         ttk.Button(pad, text="New random curve for today",
                    command=self._wp_new_curve_for_today).grid(
@@ -1527,9 +1535,6 @@ class CurveApp(tk.Tk):
                                 foreground=self._contrast_text_color(hexval))
         self._wp_cfg["bg_color"] = hexval
 
-    def _wp_monitor_changed(self):
-        self._wp_cfg["monitor_mode"] = self._wp_monitor_var.get()
-
     def _wp_reparent_changed(self):
         self._wp_cfg["attempt_worker_reparent"] = bool(self._wp_reparent_var.get())
 
@@ -1585,22 +1590,47 @@ class CurveApp(tk.Tk):
         if not silent:
             messagebox.showinfo("Saved", "Wallpaper settings saved.", parent=self._wallpaper_dialog)
 
-    def _wp_start(self):
+    def _wp_row_status(self, monitor_key):
+        """(running, pid) for one monitor row. Prefers a live Popen handle
+        from this gui.py session (self._wallpaper_procs) so 'Running' shows
+        up the instant Start is clicked, and falls back to the PID recorded
+        in that monitor's lock file (wallpaper_lock_pid_for_monitor) so a
+        wallpaper started in an earlier gui.py session -- or a previous
+        run of this one, before the app was closed and reopened -- still
+        shows as running instead of incorrectly reading 'Not running' just
+        because this session has no Popen object for it. That mismatch was
+        the root of the actual bug report this per-monitor rework fixes:
+        gui.py used to have no way to tell the Start button was about to
+        collide with a wallpaper process that outlived a previous session,
+        so it just quietly failed a few hundred milliseconds after
+        launching (acquire_lock() in wallpaper_engine.py refusing a second
+        instance -- back when locking was global instead of per-monitor)."""
+        proc = self._wallpaper_procs.get(monitor_key)
+        if proc is not None:
+            if proc.poll() is None:
+                return True, proc.pid
+            del self._wallpaper_procs[monitor_key]  # exited on its own -- drop the stale handle
+        pid = wallpaper_lock_pid_for_monitor(monitor_key)
+        return (True, pid) if pid is not None else (False, None)
+
+    def _wp_start(self, monitor_key):
         self._wp_save(silent=True)  # what starts should match what's shown, not a stale on-disk
         # copy -- silent because a blocking confirmation here would just be
         # an unwanted interruption between clicking Start and it launching
-        if self._wallpaper_proc is not None and self._wallpaper_proc.poll() is None:
+        running, pid = self._wp_row_status(monitor_key)
+        if running:
             messagebox.showinfo("Already running",
-                                 "A wallpaper process started from here is already running -- "
-                                 "stop it first if you want to restart with new settings.",
+                                 f"A wallpaper process for this monitor is already running "
+                                 f"(pid {pid}) -- stop it first if you want to restart with "
+                                 f"new settings.",
                                  parent=self._wallpaper_dialog)
             return
         try:
             kwargs = {}
             if sys.platform == "win32":
                 kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
-            self._wallpaper_proc = subprocess.Popen(
-                [sys.executable, str(WALLPAPER_ENGINE_PATH)],
+            proc = subprocess.Popen(
+                [sys.executable, str(WALLPAPER_ENGINE_PATH), "--monitor", monitor_key],
                 cwd=str(WALLPAPER_ENGINE_PATH.parent),
                 # Explicitly cut the child off from this process's own
                 # stdin/stdout/stderr rather than leaving them to be
@@ -1616,38 +1646,74 @@ class CurveApp(tk.Tk):
         except OSError as e:
             messagebox.showerror("Could not start", str(e), parent=self._wallpaper_dialog)
             return
+        self._wallpaper_procs[monitor_key] = proc
         self._wp_update_run_buttons()
-        self._wp_poll_process()
+        # No need to (re)start the poll loop here -- _open_wallpaper_dialog
+        # already kicked one off for as long as this dialog stays open, and
+        # starting another here on every click would just stack up
+        # redundant concurrent self.after() chains over time.
 
-    def _wp_stop(self):
-        if self._wallpaper_proc is None or self._wallpaper_proc.poll() is not None:
-            self._wallpaper_proc = None
+    def _wp_stop(self, monitor_key):
+        proc = self._wallpaper_procs.pop(monitor_key, None)
+        if proc is not None and proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                proc.kill()
             self._wp_update_run_buttons()
             return
-        self._wallpaper_proc.terminate()
-        try:
-            self._wallpaper_proc.wait(timeout=3)
-        except subprocess.TimeoutExpired:
-            self._wallpaper_proc.kill()
-        self._wallpaper_proc = None
+        # No Popen handle in this session -- it may have been started by
+        # an earlier gui.py session, or a previous run of this one before
+        # the app was closed and reopened (see _wp_row_status). A live
+        # wallpaper is designed to outlive the gui.py session that started
+        # it, so the lock file's recorded PID (wallpaper_lock_pid_for_monitor)
+        # is the only way to reach one gui.py itself has no in-memory
+        # handle for; wallpaper_terminate_pid ends it the same way
+        # Popen.terminate() already does above.
+        pid = wallpaper_lock_pid_for_monitor(monitor_key)
+        if pid is not None:
+            wallpaper_terminate_pid(pid)
         self._wp_update_run_buttons()
+        # Termination is asynchronous -- a quick follow-up refresh a moment
+        # later picks up the process actually being gone, rather than
+        # waiting for the next regular 2s poll tick to notice.
+        self.after(300, self._wp_update_run_buttons)
 
     def _wp_poll_process(self):
-        """Reschedules itself only while a process we started is still
-        alive, so it notices (and reflects in the Status label/buttons) if
-        the wallpaper process crashes or is closed some other way."""
-        if self._wallpaper_proc is not None and self._wallpaper_proc.poll() is None:
-            self.after(2000, self._wp_poll_process)
-        else:
-            self._wallpaper_proc = None
-            self._wp_update_run_buttons()
+        """Reschedules itself every 2s for as long as the dialog stays
+        open, refreshing every monitor row's status/buttons -- so it
+        notices (and reflects) a wallpaper process crashing, being closed
+        some other way, or having been started/stopped from a different
+        gui.py session entirely."""
+        if self._wallpaper_dialog is None or not self._wallpaper_dialog.winfo_exists():
+            return
+        self._wp_update_run_buttons()
+        self.after(2000, self._wp_poll_process)
 
     def _wp_update_run_buttons(self):
-        running = self._wallpaper_proc is not None and self._wallpaper_proc.poll() is None
-        self._wallpaper_status_var.set(f"Running (pid {self._wallpaper_proc.pid})" if running else "Not running")
-        if self._wallpaper_dialog is not None and self._wallpaper_dialog.winfo_exists():
-            self._wp_start_btn.config(state="disabled" if running else "normal")
-            self._wp_stop_btn.config(state="normal" if running else "disabled")
+        if self._wallpaper_dialog is None or not self._wallpaper_dialog.winfo_exists():
+            return
+        states = {key: self._wp_row_status(key) for key in self._wp_monitor_keys}
+        any_individual_running = any(running for key, (running, _pid) in states.items() if key != "all")
+        all_running = states.get("all", (False, None))[0]
+        for key in self._wp_monitor_keys:
+            running, pid = states[key]
+            self._wp_row_status_vars[key].set(f"Running (pid {pid})" if running else "Not running")
+            start_btn = self._wp_row_start_btns[key]
+            stop_btn = self._wp_row_stop_btns[key]
+            if running:
+                start_btn.config(state="disabled")
+                stop_btn.config(state="normal")
+            else:
+                # "Stretch across all monitors" and any individual monitor
+                # are mutually exclusive -- both would target overlapping
+                # screen area and just fight over the same WorkerW
+                # z-order -- so starting one is blocked while the other is
+                # running.
+                blocked = (key == "all" and any_individual_running) or (key != "all" and all_running)
+                start_btn.config(state="disabled" if blocked else "normal")
+                stop_btn.config(state="disabled")
 
     def _wp_new_curve_for_today(self):
         """wallpaper_engine.py caches one generated curve per (day, preset,
@@ -1658,20 +1724,25 @@ class CurveApp(tk.Tk):
         schedule (rotation_index/last_update in the config are untouched),
         so it stays on today's preset rather than advancing to tomorrow's.
 
-        This does NOT try to stop/start a wallpaper process itself --
-        self._wallpaper_proc only tracks a process this gui.py session
-        started, so it has no idea whether one is actually running if it
-        was launched earlier (a real, previously-hit bug: the button would
-        tell the user to start it manually even while it was already
-        running). Instead it just touches REGEN_REQUEST_PATH, a small
-        signal file that ANY running wallpaper_engine.py instance polls
-        for once per tick, the same cheap way it already polls for the
-        midnight day-rollover. Whichever engine is actually running picks
-        it up on its own within a fraction of a second, regenerates in the
-        background while the current curve keeps crawling on screen (with
-        a small loading spinner and "Generating a new curve..." note), and
-        swaps the new one in automatically the moment it's ready -- no
-        restart, no close and reopen, nothing else for the user to do."""
+        This does NOT try to stop/start any wallpaper process itself --
+        self._wallpaper_procs only tracks processes this gui.py session
+        started, so it has no idea whether one is actually running (for
+        any given monitor) if it was launched earlier (a real,
+        previously-hit bug: the button would tell the user to start it
+        manually even while it was already running). Instead it just
+        touches one monitor-scoped regen-request signal file per monitor
+        this dialog knows about (see wallpaper_regen_request_path and
+        self._wp_monitor_keys) -- whichever wallpaper_engine.py instances
+        are actually running each notice their own on the next tick (same
+        cheap every-frame check already used for the day-rollover), pick
+        it up on their own within a fraction of a second, regenerate in
+        the background while the current curve keeps crawling on screen
+        (with a small loading spinner and "Generating a new curve..."
+        note), and swap the new one in automatically the moment it's
+        ready -- no restart, no close and reopen, nothing else for the
+        user to do. Touching a regen-request file for a monitor that
+        isn't currently running is harmless -- see
+        regen_request_path_for_monitor's docstring in wallpaper_engine.py."""
         today = date.today().isoformat()
         cleared = 0
         if WALLPAPER_CACHE_DIR.exists():
@@ -1683,7 +1754,8 @@ class CurveApp(tk.Tk):
                     pass
 
         try:
-            WALLPAPER_REGEN_REQUEST_PATH.write_text(date.today().isoformat())
+            for monitor_key in self._wp_monitor_keys:
+                wallpaper_regen_request_path(monitor_key).write_text(today)
         except OSError as e:
             messagebox.showerror(
                 "Could not request a new curve", str(e), parent=self._wallpaper_dialog)

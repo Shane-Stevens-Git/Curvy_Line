@@ -25,17 +25,33 @@ and rotation logic on macOS/Linux even though it isn't a real wallpaper
 there.
 
 gui.py's "Configure Wallpaper..." dialog edits wallpaper_config.json for
-you (colors, presets, edge, monitor_mode, and so on) and can start/stop
-this script directly -- hand-editing the file is only needed for anything
-that dialog doesn't cover yet.
+you (colors, presets, edge, and so on -- the preset rotation is shared
+across every monitor) and can start/stop one of these per monitor at
+once -- hand-editing the file is only needed for anything that dialog
+doesn't cover yet.
 
-Refuses to start a second instance (see _acquire_lock): two of these
-running at once would both try to reparent into WorkerW and redraw the
+Multiple monitors, run independently: pass '--monitor <mode>' (a
+connected-monitor index like "0"/"1", or "all" to stretch one instance
+across every monitor -- see enumerate_monitors/_virtual_screen_bounds) to
+tell a given instance which monitor it's responsible for. gui.py's
+Configure Wallpaper dialog now has one Start/Stop control per monitor and
+launches a separate instance of this script, with its own --monitor flag,
+for each one you start -- so Monitor 1 and Monitor 2 can each be running
+their own instance (rendering the same shared preset rotation, just
+independently) at the same time. Each instance gets its own lock file,
+debug log, and regen-request signal, scoped by --monitor (see
+_parse_monitor_arg/lock_path_for_monitor/etc.), so they never fight over
+shared state -- refuses to start a *second* instance for the *same*
+monitor though (see acquire_lock): two of those running at once would
+both try to reparent into the same WorkerW and redraw the same patch of
 screen, which can make the whole desktop sluggish -- whether the earlier
 one was started from gui.py, a previous run of this script, or the test
-.bat file.
+.bat file. Omitting --monitor entirely (a bare double-click, or the test
+.bat file) falls back to wallpaper_config.json's legacy single
+monitor_mode field and the original un-suffixed lock/log/regen filenames,
+so it still refuses a second *of those* running at once too.
 
-Run directly with:  python wallpaper_engine.py
+Run directly with:  python wallpaper_engine.py [--monitor <mode>]
 (same .venv / dependencies as gui.py -- see run.bat/run.sh)
 """
 import ctypes
@@ -98,6 +114,7 @@ import json
 import os
 import queue
 import random
+import signal
 import threading
 import time
 import tkinter as tk
@@ -108,22 +125,86 @@ import numpy as np
 
 from organic_curve import generate, crawl_bands, build_gradient_palette, GenerationError, FILL_SHAPES
 
+
+def _parse_monitor_arg():
+    """Scans sys.argv for '--monitor <mode>' and returns the raw string
+    mode if given, or None. gui.py's Configure Wallpaper dialog now starts
+    one of these processes *per selected monitor* rather than a single
+    shared instance (see the module docstring), passing this flag so each
+    process knows which monitor it -- specifically -- is responsible for,
+    independent of whatever wallpaper_config.json's legacy single
+    'monitor_mode' field says. Parsed here, at true module level, before
+    BASE_DIR's dependent path constants below are computed, since several
+    of them (LOCK_PATH, DEBUG_LOG_PATH, REGEN_REQUEST_PATH) need to be
+    scoped per-monitor too -- otherwise two concurrently-running instances
+    would fight over the same lock file, overwrite each other's debug
+    log, and steal each other's regen-request signal. A bare double-click
+    or a .bat file that runs this script directly without --monitor gets
+    None here, which keeps the original un-suffixed filenames and the
+    single-instance-only behavior exactly as before."""
+    for i, arg in enumerate(sys.argv):
+        if arg == "--monitor" and i + 1 < len(sys.argv):
+            return sys.argv[i + 1]
+    return None
+
+
+MONITOR_ARG = _parse_monitor_arg()
+
 BASE_DIR = Path(__file__).parent
+
+
+def _path_suffix_for_monitor(monitor_key):
+    """'0' -> '_0', 'all' -> '_all', None -> '' (see MONITOR_ARG). Used to
+    build this process's own lock/debug-log/regen-request filenames so
+    concurrently-running instances -- one per monitor -- never collide.
+    Sanitized to a small safe character set even though today's actual
+    values (None, 'primary', 'all', or a small digit string from
+    enumerate_monitors()) never contain anything that would need it,
+    since this is interpolated straight into a filename."""
+    if monitor_key is None:
+        return ""
+    safe = "".join(c if (c.isalnum() or c in "-_") else "_" for c in str(monitor_key))
+    return f"_{safe}" if safe else ""
+
+
+def lock_path_for_monitor(monitor_key):
+    """The single-instance lock file (see acquire_lock/release_lock) a
+    wallpaper_engine.py instance launched with '--monitor <monitor_key>'
+    uses -- also called by gui.py (via lock_pid_for_monitor) to check
+    whether an instance for a given monitor is currently running,
+    independent of whether gui.py's own current session is the one that
+    started it."""
+    return BASE_DIR / f"wallpaper{_path_suffix_for_monitor(monitor_key)}.lock"
+
+
+def debug_log_path_for_monitor(monitor_key):
+    return BASE_DIR / f"wallpaper_debug{_path_suffix_for_monitor(monitor_key)}.log"
+
+
+def regen_request_path_for_monitor(monitor_key):
+    return BASE_DIR / f"wallpaper_regen{_path_suffix_for_monitor(monitor_key)}.request"
+
+
 CONFIG_PATH = BASE_DIR / "wallpaper_config.json"
 CACHE_DIR = BASE_DIR / "wallpaper_cache"
-LOCK_PATH = BASE_DIR / "wallpaper.lock"
-DEBUG_LOG_PATH = BASE_DIR / "wallpaper_debug.log"
+LOCK_PATH = lock_path_for_monitor(MONITOR_ARG)
+DEBUG_LOG_PATH = debug_log_path_for_monitor(MONITOR_ARG)
 
-# gui.py's "New random curve for today" button doesn't manage the running
-# engine process at all (it may not even know one is running -- it could
-# have been started in an earlier app session). Instead it just clears
-# today's cache and touches this file; whichever wallpaper_engine.py
-# instance is actually running notices it on the next tick (same cheap
-# every-frame check already used for the day-rollover), consumes it, and
-# regenerates in place -- no restart, no close/reopen, and the old curve
-# keeps crawling on screen the whole time, exactly like an ordinary
-# midnight rollover.
-REGEN_REQUEST_PATH = BASE_DIR / "wallpaper_regen.request"
+# gui.py's "New random curve for today" button doesn't manage any running
+# engine process directly (it may not even know one is running -- it
+# could have been started in an earlier app session, for any subset of
+# monitors). Instead it just clears today's cache and touches one of
+# these files per monitor it knows about; whichever wallpaper_engine.py
+# instance is actually running notices its own (monitor-scoped) one on
+# the next tick (same cheap every-frame check already used for the
+# day-rollover), consumes it, and regenerates in place -- no restart, no
+# close/reopen, and the old curve keeps crawling on screen the whole
+# time, exactly like an ordinary midnight rollover. Touching a
+# monitor-scoped file for a monitor that isn't currently running is
+# harmless -- it just sits there and gets silently consumed as a no-op
+# the moment (if ever) that monitor's instance starts, since
+# _start_generation() already guards against a redundant regeneration.
+REGEN_REQUEST_PATH = regen_request_path_for_monitor(MONITOR_ARG)
 
 # Set True only while actively chasing the "clicks blocked on the GUI's
 # monitor" bug -- writes timestamped diagnostics (monitor geometry, window
@@ -536,6 +617,56 @@ def release_lock():
         pass
 
 
+def lock_pid_for_monitor(monitor_key):
+    """The PID of a live wallpaper_engine.py instance currently holding
+    the lock for monitor_key (see lock_path_for_monitor), or None if no
+    such lock exists or the PID it names is no longer alive (a stale lock
+    left behind by a crash or a forceful kill, same as acquire_lock's own
+    staleness check). Used by gui.py to show accurate Start/Stop state
+    for each monitor row even across gui.py restarts -- a live wallpaper
+    is designed to keep running after gui.py closes, so a later gui.py
+    session otherwise has no idea one is already running for a given
+    monitor until it tries to start a second one and watches it silently
+    fail (see acquire_lock's docstring)."""
+    path = lock_path_for_monitor(monitor_key)
+    if not path.exists():
+        return None
+    try:
+        pid = int(path.read_text().strip())
+    except (OSError, ValueError):
+        return None
+    return pid if _pid_alive(pid) else None
+
+
+def terminate_pid(pid):
+    """Best-effort termination of an arbitrary PID. Used by gui.py's
+    per-monitor Stop button to end a wallpaper_engine.py instance that
+    outlived the gui.py session that started it -- a live wallpaper is
+    designed to keep running after gui.py closes, so a later gui.py
+    session has no Popen handle for it, only the PID recorded in its
+    lock file (see lock_pid_for_monitor). Same OpenProcess/TerminateProcess
+    mechanism Popen.terminate() already uses on Windows under the hood, so
+    this isn't a new class of capability -- just extending the one gui.py's
+    Stop button already had to a process it didn't itself Popen(). Returns
+    True if a termination request was sent successfully; the caller should
+    still expect the lock file / process to take a moment to actually go
+    away."""
+    if sys.platform == "win32":
+        PROCESS_TERMINATE = 0x0001
+        handle = ctypes.windll.kernel32.OpenProcess(PROCESS_TERMINATE, False, pid)
+        if not handle:
+            return False
+        try:
+            return bool(ctypes.windll.kernel32.TerminateProcess(handle, 0))
+        finally:
+            ctypes.windll.kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, signal.SIGTERM)
+        return True
+    except OSError:
+        return False
+
+
 def current_preset(cfg):
     presets = cfg["presets"]
     idx = cfg.get("rotation_index", 0) % len(presets)
@@ -623,7 +754,29 @@ def load_or_generate_path(cfg, screen_w, screen_h):
                 fill_shape=preset.get("fill_shape", "square")
                 if preset.get("fill_shape") in FILL_SHAPES else "square",
             )
-            np.save(cache_file, path)
+            # Two monitors with the same resolution (common on twin
+            # identical-model setups) running as separate concurrent
+            # instances (see MONITOR_ARG) can both land on this exact same
+            # cache_file at once, each with its own independently
+            # generated (different-seed) curve. Writing straight to
+            # cache_file would risk one process's np.save() interleaving
+            # with another's, corrupting the file either process might
+            # then try to load. Writing to a PID-unique temp file first
+            # and os.replace()-ing it into place is atomic on both Windows
+            # and POSIX for a same-directory rename, so whichever instance
+            # finishes last simply and safely wins -- never a torn file.
+            # The temp name ends in .npy too so np.save() doesn't append
+            # its own .npy suffix on top of the pid suffix.
+            tmp_file = cache_file.with_name(cache_file.name + f".tmp{os.getpid()}.npy")
+            try:
+                np.save(tmp_file, path)
+                os.replace(tmp_file, cache_file)
+            except Exception:
+                try:
+                    tmp_file.unlink()
+                except OSError:
+                    pass
+                raise
             return path, display_scale
         except GenerationError as exc:
             last_error = exc
@@ -1393,7 +1546,19 @@ class WallpaperWindow:
         # hwnd, harden every top-level window this process currently owns.
         self._harden_own_windows("after-root-guard")
 
-        monitor_mode = self.cfg.get("monitor_mode", "primary")
+        # MONITOR_ARG (a '--monitor <mode>' CLI argument -- see
+        # _parse_monitor_arg) is how gui.py's Configure Wallpaper dialog
+        # now targets a specific monitor, since it can start a separate
+        # instance of this engine per monitor at once; cfg["monitor_mode"]
+        # is kept only as a fallback for a bare double-click or a .bat
+        # file that runs this script directly without --monitor.
+        # Deliberately read into a local rather than written back into
+        # self.cfg -- save_config(self.cfg) (see _poll_generation's daily
+        # rollover) would otherwise bake this one instance's own target
+        # into the single shared wallpaper_config.json on disk, stomping
+        # whatever that legacy field was last set to for every other
+        # concurrently-running instance too.
+        monitor_mode = MONITOR_ARG if MONITOR_ARG is not None else self.cfg.get("monitor_mode", "primary")
         if monitor_mode not in ("primary", "all") and not _is_monitor_index(monitor_mode):
             monitor_mode = "primary"
         self.x, self.y, self.w, self.h = _virtual_screen_bounds(self.root, monitor_mode)
@@ -1779,7 +1944,8 @@ class WallpaperWindow:
 
 
 def main():
-    _debug_log(f"=== wallpaper_engine.py starting, pid={os.getpid()} ===")
+    _debug_log(f"=== wallpaper_engine.py starting, pid={os.getpid()}, "
+               f"monitor_arg={MONITOR_ARG!r} (lock={LOCK_PATH.name}) ===")
     _debug_log(f"DPI awareness result: {DPI_AWARENESS_RESULT}")
 
     test_seconds = None
@@ -1791,8 +1957,9 @@ def main():
                 pass
 
     if not acquire_lock():
-        print("Another wallpaper_engine.py instance already appears to be running "
-              "-- exiting instead of starting a second one on top of it.")
+        print(f"Another wallpaper_engine.py instance already appears to be running "
+              f"for this monitor ({MONITOR_ARG!r}) -- exiting instead of starting a "
+              f"second one on top of it.")
         return
 
     if sys.platform != "win32":
