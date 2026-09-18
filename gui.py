@@ -1374,13 +1374,20 @@ class CurveApp(tk.Tk):
                          variable=self._wp_reparent_var, command=self._wp_reparent_changed).grid(
             row=grow, column=0, columnspan=2, sticky="w")
         grow += 1
-        ttk.Label(globals_frame, text="Off by default because this froze all clicks on the\n"
-                            "monitor the wallpaper was on until it was fixed by\n"
-                            "testing. With it off (recommended), the wallpaper sits\n"
-                            "on top of your icons instead of behind them -- clicks\n"
-                            "still reach them, you just can't see them to aim. Only\n"
-                            "turn this on if you want to try the behind-icons look\n"
-                            "again and are prepared for that freeze to come back.",
+        ttk.Label(globals_frame, text="Off by default because this once froze all clicks on\n"
+                            "the monitor the wallpaper was on until the wallpaper was\n"
+                            "closed. Since then we've added a click/activation guard\n"
+                            "plus logging to catch exactly what happens if it recurs,\n"
+                            "and a watchdog that recovers if Explorer restarts -- but\n"
+                            "none of that has been tried on real hardware yet. Turning\n"
+                            "this on is a real test of it, not a known-safe setting.\n"
+                            "If clicks do stop responding on that monitor: try your\n"
+                            "other monitor or Ctrl+Shift+Esc for Task Manager to end\n"
+                            "wallpaper_engine.py, then send the wallpaper_debug.log\n"
+                            "file from this folder so the guard can be improved.\n"
+                            "With it off (recommended for now), the wallpaper sits on\n"
+                            "top of your icons instead of behind them -- clicks still\n"
+                            "reach them, you just can't see them to aim.",
                   foreground="#a15c00").grid(row=grow, column=0, columnspan=2, sticky="w", pady=(2, 4))
         grow += 1
 

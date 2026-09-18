@@ -179,6 +179,17 @@ MAX_GEN_DIMENSION = 1600
 # on the CPU/GPU for something meant to run all day, every day.
 FRAME_MS = 50
 
+# How often tick() re-checks that a successful WorkerW reparent is still
+# intact (seconds). Explorer restarting (crash, "Restart Explorer" from
+# Task Manager, some Windows updates) destroys and respawns WorkerW,
+# silently orphaning anything that was SetParent'd into the old one --
+# our window would then quietly become a normal top-level window again
+# without us knowing, which is its own click/z-order risk. Checked in
+# tick() rather than every frame since GetParent/IsWindow calls, however
+# cheap, have no reason to run 20 times a second for something that only
+# changes when Explorer itself restarts.
+REPARENT_CHECK_INTERVAL = 5.0
+
 # fill_shape is 'square' for every default preset -- for a wallpaper (unlike
 # the GUI's boxed preview) the whole point is to cover the monitor
 # edge-to-edge, and 'square' is the shape that means "the whole inset
@@ -234,14 +245,28 @@ DEFAULT_CONFIG = {
     # operation that was confirmed, via extensive testing on a real
     # 2-monitor machine, to cause the monitor the GUI is on to stop
     # accepting *any* clicks (including the taskbar and unrelated apps)
-    # until the GUI was minimized. Disabling it (the default) uses a
-    # plain positioned/lowered/click-through window instead, which loses
-    # the "rendered behind your icons" look (icons are visually covered
-    # while it runs, though clicks should still reach them) but is not
-    # known to freeze anything. Turn this on from the "Configure
-    # Wallpaper..." dialog only if you want to try the behind-icons look
-    # again and are prepared for that same freeze to come back --
-    # gui.py's checkbox for this carries that warning.
+    # until the GUI was minimized. The working theory was a focus/
+    # activation conflict between gui.py's window and this one, and two
+    # layers now specifically target that: _make_input_safe() (extended
+    # window styles: never activatable, click-through) and, new since
+    # that didn't get re-verified live, _install_activation_guard() (a
+    # message-level WM_MOUSEACTIVATE swallow plus activation-message
+    # logging, so a repro would actually leave a trace in
+    # wallpaper_debug.log instead of just "it froze again"). Both apply
+    # unconditionally, whether or not this setting is even on. tick() also
+    # now watches that the reparent stays valid (see REPARENT_CHECK_INTERVAL)
+    # and quietly recovers if Explorer restarts and orphans it.
+    #
+    # None of that has been confirmed against the original freeze on real
+    # hardware yet, though -- it's a well-reasoned first attempt, not a
+    # verified fix. Still off by default until it's actually been tried
+    # again on the machine that reproduced it. Disabling it uses a plain
+    # positioned/lowered/click-through window instead, which loses the
+    # "rendered behind your icons" look (icons are visually covered while
+    # it runs, though clicks should still reach them) but is not known to
+    # freeze anything. Turn this on from the "Configure Wallpaper..."
+    # dialog to test the new mitigations -- gui.py's checkbox for this
+    # explains what's changed and what to watch for.
     "attempt_worker_reparent": False,
     "presets": DEFAULT_PRESETS,
     "rotation_index": 0,
@@ -517,6 +542,104 @@ def _make_input_safe(hwnd):
         _debug_log(f"input-safe: FAILED: {exc!r}")
 
 
+# Kept alive for the life of the process -- ctypes.WINFUNCTYPE wraps a
+# Python callable in a real C function pointer that Windows calls directly
+# on every message to this window. If the Python wrapper object were ever
+# garbage-collected, that pointer would dangle and the *next* message sent
+# to this window would crash the process outright. Module-level dict, not
+# a WallpaperWindow attribute, so it survives even if something odd
+# happens to that object's lifetime.
+_activation_guard_refs = {}
+
+
+def _install_activation_guard(hwnd):
+    """Belt-and-suspenders on top of _make_input_safe(): subclass hwnd's
+    own window procedure so we see every message Windows sends it, not
+    just whatever the WS_EX_* extended styles imply.
+
+    Two things this buys that the extended styles alone don't guarantee:
+
+    1. WM_MOUSEACTIVATE is the message Windows sends a window (or its
+       nearest top-level ancestor) to ask "should a click here activate
+       you?" *before* deciding whether to also dispatch the click as a
+       normal mouse message. WS_EX_NOACTIVATE should already make Windows
+       answer that question "no" on its own, but a click that lands on
+       this window while it's a cross-process child (SetParent'd into a
+       WorkerW owned by explorer.exe, not a normal top-level window
+       anymore) is exactly the scenario the original freeze happened in,
+       and it's the one case the extended-style contract is least tested
+       for. Intercepting the message directly and returning
+       MA_NOACTIVATEANDEAT is a stronger, more explicit guarantee: it
+       can't activate this window, full stop, regardless of how this
+       particular Windows build resolves the extended styles for a
+       reparented child.
+    2. Every activation/focus message this window receives (there should
+       be close to none, if the guard is working) gets logged with its
+       wparam/lparam. If the freeze still happens on a future test, this
+       is the difference between re-guessing from scratch and actually
+       seeing, message by message, what Windows tried to do to this
+       window in the moment it happened.
+
+    Forwards everything it doesn't explicitly handle to the original
+    (Tk-owned) window procedure via CallWindowProcW, so Tk's own message
+    handling -- painting, geometry, everything else -- is untouched.
+    Best-effort: if this fails to install, the wallpaper still runs with
+    whatever _make_input_safe already applied, it just loses this extra
+    layer and the diagnostics."""
+    if sys.platform != "win32":
+        return
+    try:
+        from ctypes import wintypes
+
+        GWLP_WNDPROC = -4
+        WM_MOUSEACTIVATE = 0x0021
+        WM_ACTIVATE = 0x0006
+        WM_NCACTIVATE = 0x0086
+        WM_SETFOCUS = 0x0007
+        WM_KILLFOCUS = 0x0008
+        MA_NOACTIVATEANDEAT = 3
+        _LOGGED_MSGS = (WM_ACTIVATE, WM_NCACTIVATE, WM_SETFOCUS, WM_KILLFOCUS)
+
+        user32 = ctypes.windll.user32
+        LRESULT = ctypes.c_ssize_t
+        WNDPROC = ctypes.WINFUNCTYPE(LRESULT, wintypes.HWND, wintypes.UINT,
+                                      wintypes.WPARAM, wintypes.LPARAM)
+
+        user32.GetWindowLongPtrW.restype = ctypes.c_void_p
+        user32.GetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int]
+        user32.SetWindowLongPtrW.restype = ctypes.c_void_p
+        user32.SetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_void_p]
+        user32.CallWindowProcW.restype = LRESULT
+        user32.CallWindowProcW.argtypes = [ctypes.c_void_p, wintypes.HWND, wintypes.UINT,
+                                            wintypes.WPARAM, wintypes.LPARAM]
+
+        original = user32.GetWindowLongPtrW(hwnd, GWLP_WNDPROC)
+        if not original:
+            _debug_log("activation-guard: GetWindowLongPtrW returned no original "
+                       "wndproc -- skipping install rather than risk breaking Tk's own "
+                       "message handling.")
+            return
+
+        def _wndproc(_hwnd, msg, wparam, lparam):
+            if msg == WM_MOUSEACTIVATE:
+                _debug_log(f"activation-guard: WM_MOUSEACTIVATE on hwnd={_hwnd} -- "
+                           f"swallowing it (returning MA_NOACTIVATEANDEAT) so this "
+                           f"click can never activate/focus this window.")
+                return MA_NOACTIVATEANDEAT
+            if msg in _LOGGED_MSGS:
+                _debug_log(f"activation-guard: hwnd={_hwnd} received msg={msg:#06x} "
+                           f"wparam={wparam:#x} lparam={lparam:#x} -- forwarding to "
+                           f"the original wndproc unchanged.")
+            return user32.CallWindowProcW(original, _hwnd, msg, wparam, lparam)
+
+        new_proc = WNDPROC(_wndproc)
+        _activation_guard_refs[hwnd] = new_proc
+        user32.SetWindowLongPtrW(hwnd, GWLP_WNDPROC, ctypes.cast(new_proc, ctypes.c_void_p))
+        _debug_log(f"activation-guard: installed on hwnd={hwnd}, original wndproc={original:#x}")
+    except Exception as exc:  # noqa: BLE001 -- best-effort, must never crash the wallpaper
+        _debug_log(f"activation-guard: FAILED to install: {exc!r}")
+
+
 def _rect_overlap_area(a, b):
     """Intersection area of two (left, top, right, bottom) rects, or 0 if
     they don't overlap (or either is missing/degenerate)."""
@@ -568,9 +691,11 @@ def reparent_behind_desktop_icons(hwnd, target_rect=None):
     64-bit window handle on 64-bit Windows -- a well-known and easy-to-hit
     bug that produces a garbage handle instead of a clean failure.
 
-    Returns True if reparenting succeeded, False if the trick did not work
-    on this Windows build/setup (caller should fall back to a normal
-    window rather than crash)."""
+    Returns the WorkerW hwnd we attached to (truthy -- the caller only
+    needs to know reparenting succeeded, but tick()'s reparent-health
+    watchdog wants the actual handle to keep checking it's still valid),
+    or False if the trick did not work on this Windows build/setup
+    (caller should fall back to a normal window rather than crash)."""
     if sys.platform != "win32":
         return False
 
@@ -733,7 +858,7 @@ def reparent_behind_desktop_icons(hwnd, target_rect=None):
             _debug_log(f"reparent: SetWindowPos(rel_x={rel_x}, rel_y={rel_y}, "
                        f"w={want_w}, h={want_h}) -> ok={ok}, "
                        f"rect_after_reposition={_get_window_rect(hwnd)}")
-    return True
+    return target_workerw
 
 
 # --- Tkinter rendering ---------------------------------------------------
@@ -814,6 +939,7 @@ class WallpaperWindow:
             root_hwnd = self.root.winfo_id()
         except tk.TclError:
             root_hwnd = hwnd
+        self._root_hwnd = root_hwnd  # kept for tick()'s reparent-health watchdog
         _debug_log(f"root_hwnd={root_hwnd}, canvas_hwnd={hwnd}, "
                    f"root rect before reparent={_get_window_rect(root_hwnd)}")
 
@@ -825,8 +951,17 @@ class WallpaperWindow:
         # (and a stronger guarantee than) the WorkerW reparenting below,
         # so it applies whether or not that succeeds.
         _make_input_safe(root_hwnd)
+        # A second, message-level layer on top of the extended styles
+        # above -- see _install_activation_guard()'s docstring for why
+        # this exists separately rather than trusting the styles alone,
+        # especially once this window becomes a cross-process WorkerW
+        # child below.
+        _install_activation_guard(root_hwnd)
 
         target_rect = (self.x, self.y, self.x + self.w, self.y + self.h)
+        self._worker_hwnd = None  # set below if reparenting succeeds; watched by tick()
+        self._reparent_target_rect = target_rect
+        self._reparent_check_due = time.time() + REPARENT_CHECK_INTERVAL
         attempt_reparent = bool(self.cfg.get("attempt_worker_reparent", False))
         if attempt_reparent:
             reparented = reparent_behind_desktop_icons(root_hwnd, target_rect=target_rect)
@@ -858,6 +993,7 @@ class WallpaperWindow:
             except tk.TclError:
                 pass
         else:
+            self._worker_hwnd = reparented  # the actual WorkerW hwnd -- watched by tick()
             _debug_log(f"root rect after reparent={_get_window_rect(root_hwnd)}")
 
         # Finally make it visible -- everything above (geometry, the
@@ -918,6 +1054,58 @@ class WallpaperWindow:
         self.display_scale = display_scale
         self._phase = 0.0
 
+    def _check_reparent_health(self):
+        """Called periodically from tick() (see REPARENT_CHECK_INTERVAL),
+        only when a WorkerW reparent actually succeeded at startup
+        (self._worker_hwnd is set). Explorer restarting destroys and
+        respawns WorkerW, which silently orphans anything that was
+        SetParent'd into the old one -- Windows doesn't send any
+        notification for this, our window just quietly becomes a normal
+        top-level window again (still input-safe, thanks to
+        _make_input_safe/_install_activation_guard, but no longer behind
+        the icons, and back to whatever the normal top-level z-order
+        happens to do with it). Detected here by checking whether our
+        parent is still that same WorkerW handle and that handle is still
+        a live window at all; if not, this attempts one clean
+        re-reparent (reparent_behind_desktop_icons is idempotent -- it
+        looks for an existing candidate WorkerW before asking Progman to
+        spawn a new one) and falls back to lower() if that fails too, the
+        same safety net __init__ uses on first startup."""
+        if sys.platform != "win32" or self._worker_hwnd is None:
+            return
+        try:
+            from ctypes import wintypes
+            user32 = ctypes.windll.user32
+            user32.GetParent.restype = wintypes.HWND
+            user32.GetParent.argtypes = [wintypes.HWND]
+            user32.IsWindow.restype = wintypes.BOOL
+            user32.IsWindow.argtypes = [wintypes.HWND]
+
+            still_valid = bool(user32.IsWindow(self._worker_hwnd))
+            current_parent = user32.GetParent(self._root_hwnd)
+            if still_valid and current_parent == self._worker_hwnd:
+                return  # still attached exactly where we left it -- nothing to do
+
+            _debug_log(f"reparent-health: lost -- worker_hwnd={self._worker_hwnd} "
+                       f"still_valid={still_valid}, current_parent={current_parent} "
+                       f"(expected {self._worker_hwnd}). Explorer likely restarted. "
+                       f"Attempting to re-reparent.")
+            new_worker = reparent_behind_desktop_icons(
+                self._root_hwnd, target_rect=self._reparent_target_rect)
+            if new_worker:
+                self._worker_hwnd = new_worker
+                _debug_log(f"reparent-health: recovered, new worker_hwnd={new_worker}")
+            else:
+                self._worker_hwnd = None
+                _debug_log("reparent-health: re-reparent failed -- falling back to "
+                           "lower() so this can't sit on top of other apps.")
+                try:
+                    self.root.lower()
+                except tk.TclError:
+                    pass
+        except Exception as exc:  # noqa: BLE001 -- a watchdog must never itself crash the wallpaper
+            _debug_log(f"reparent-health: check FAILED: {exc!r}")
+
     def _draw_spinner(self, cx, cy, radius, width, color="#ffffff"):
         """A simple rotating-arc loading spinner, drawn fresh each tick at
         self._spinner_angle (advanced in tick()). Used both for the
@@ -950,6 +1138,9 @@ class WallpaperWindow:
             self._start_generation()
 
         now = time.time()
+        if now >= self._reparent_check_due:
+            self._reparent_check_due = now + REPARENT_CHECK_INTERVAL
+            self._check_reparent_health()
         dt = max(0.0, min(0.25, now - self._last_tick))  # clamp a stall/lag spike
         self._last_tick = now
         # 220 deg/sec is a brisk, clearly-spinning rate without being
