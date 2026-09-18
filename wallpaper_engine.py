@@ -510,6 +510,23 @@ def _make_input_safe(hwnd):
     window is ever shown, so there's no window of time where it could
     grab focus before the style takes effect.
 
+    A real-hardware test of that fix alone still froze. The debug log from
+    that run showed this window receiving a WM_KILLFOCUS ~20 seconds in
+    with wParam=0 -- focus going to *nothing*, not to whatever the user
+    actually clicked -- but no WM_SETFOCUS was ever logged, even though
+    the message-level guard was already installed by then (see
+    _install_activation_guard). That means this window most likely picked
+    up real keyboard focus even earlier than that, during Tk's own
+    internal window setup, before either guard existed to see or stop it
+    -- WS_EX_NOACTIVATE blocks *activation* (clicks, Alt-Tab,
+    SetForegroundWindow) but has nothing to say about Tk making an
+    ordinary SetFocus() call of its own accord, which is a different
+    Win32 mechanism. So on top of the style, this now also explicitly
+    calls SetFocus(None) itself -- a direct guarantee that this window
+    holds no keyboard focus at this point, not an inference from a style
+    flag. Called as early as possible in __init__, before overrideredirect/
+    geometry/canvas creation, to close the gap as tightly as possible.
+
     Best-effort: failure here should never crash the wallpaper, since a
     visible-but-occasionally-input-grabby window still beats no wallpaper
     at all."""
@@ -538,6 +555,21 @@ def _make_input_safe(hwnd):
         user32.SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA)
         _debug_log(f"input-safe: hwnd={hwnd}, old ex_style={ex_style:#x}, new ex_style={new_style:#x} "
                    f"(added WS_EX_LAYERED|WS_EX_TRANSPARENT|WS_EX_NOACTIVATE)")
+
+        # Direct guarantee, not just an inference from the style above --
+        # see the docstring. GetFocus first purely for the log: knowing
+        # whether this window actually held focus *before* we release it
+        # is exactly the piece of evidence the previous test run couldn't
+        # answer.
+        user32.GetFocus.restype = ctypes.c_void_p
+        user32.SetFocus.restype = ctypes.c_void_p
+        user32.SetFocus.argtypes = [ctypes.c_void_p]
+        before = user32.GetFocus()
+        user32.SetFocus(None)
+        after = user32.GetFocus()
+        _debug_log(f"input-safe: focus before SetFocus(None)={before}, after={after} "
+                   f"(hwnd={hwnd} -- before==hwnd would confirm this window already had "
+                   f"real keyboard focus at this point in startup)")
     except Exception as exc:  # noqa: BLE001 -- best-effort safety net only
         _debug_log(f"input-safe: FAILED: {exc!r}")
 
@@ -573,8 +605,15 @@ def _install_activation_guard(hwnd):
        can't activate this window, full stop, regardless of how this
        particular Windows build resolves the extended styles for a
        reparented child.
-    2. Every activation/focus message this window receives (there should
-       be close to none, if the guard is working) gets logged with its
+    2. WM_SETFOCUS means this window just received real keyboard focus --
+       something _make_input_safe()'s SetFocus(None) call is meant to
+       prevent from the outset, but if it happens anyway (at any later
+       point in this window's life, for any reason), immediately calling
+       SetFocus(None) again right here hands it straight back rather than
+       letting this window sit there holding focus, which real-hardware
+       testing linked to the freeze (see _make_input_safe()'s docstring).
+    3. Every activation/focus message this window receives (there should
+       be close to none, if the guards are working) gets logged with its
        wparam/lparam. If the freeze still happens on a future test, this
        is the difference between re-guessing from scratch and actually
        seeing, message by message, what Windows tried to do to this
@@ -612,6 +651,8 @@ def _install_activation_guard(hwnd):
         user32.CallWindowProcW.restype = LRESULT
         user32.CallWindowProcW.argtypes = [ctypes.c_void_p, wintypes.HWND, wintypes.UINT,
                                             wintypes.WPARAM, wintypes.LPARAM]
+        user32.SetFocus.restype = ctypes.c_void_p
+        user32.SetFocus.argtypes = [ctypes.c_void_p]
 
         original = user32.GetWindowLongPtrW(hwnd, GWLP_WNDPROC)
         if not original:
@@ -626,6 +667,13 @@ def _install_activation_guard(hwnd):
                            f"swallowing it (returning MA_NOACTIVATEANDEAT) so this "
                            f"click can never activate/focus this window.")
                 return MA_NOACTIVATEANDEAT
+            if msg == WM_SETFOCUS:
+                _debug_log(f"activation-guard: WM_SETFOCUS on hwnd={_hwnd} (wparam={wparam:#x}, "
+                           f"the window that HAD focus) -- this window should never hold "
+                           f"real keyboard focus, handing it straight back via SetFocus(None).")
+                result = user32.CallWindowProcW(original, _hwnd, msg, wparam, lparam)
+                user32.SetFocus(None)
+                return result
             if msg in _LOGGED_MSGS:
                 _debug_log(f"activation-guard: hwnd={_hwnd} received msg={msg:#06x} "
                            f"wparam={wparam:#x} lparam={lparam:#x} -- forwarding to "
@@ -904,6 +952,43 @@ class WallpaperWindow:
         # flash up and contest focus/activation with gui.py. Shown for
         # real only at the very end, via deiconify().
         self.root.withdraw()
+
+        # Get the real hwnd and lock down input safety *immediately* --
+        # before overrideredirect/geometry/configure/canvas creation, not
+        # after. A real-hardware test of a first version of this (applied
+        # later, right before reparenting) still froze, and the debug log
+        # from that run showed our window receiving a WM_KILLFOCUS ~20s in
+        # with wParam=0 (focus going to *nothing*, not to whatever the
+        # user actually clicked) -- but no WM_SETFOCUS was ever logged,
+        # even though the guard was already installed by the time
+        # reparenting ran. The likely explanation: this window picked up
+        # real keyboard focus even earlier, during Tk's own internal setup
+        # (tk.Tk() itself, or one of the calls below), before our hook
+        # existed to see it -- WS_EX_NOACTIVATE stops *activation*
+        # (clicking, Alt-Tab, SetForegroundWindow), but says nothing about
+        # Tk making its own ordinary SetFocus() call as part of showing a
+        # normal window, which is a different Win32 mechanism entirely.
+        # Moving this here closes that gap, and _make_input_safe() now
+        # also explicitly calls SetFocus(None) as a direct, not just
+        # style-based, guarantee that this window starts out holding no
+        # focus at all -- see its docstring.
+        self.root.update_idletasks()
+        try:
+            root_hwnd = self.root.winfo_id()
+        except tk.TclError:
+            root_hwnd = None
+        self._root_hwnd = root_hwnd  # kept for tick()'s reparent-health watchdog
+        _debug_log(f"root_hwnd={root_hwnd} (fetched immediately after Tk() construction, "
+                   f"before any other window setup)")
+        _make_input_safe(root_hwnd)
+        # A second, message-level layer on top of the extended styles
+        # above -- see _install_activation_guard()'s docstring for why
+        # this exists separately rather than trusting the styles alone,
+        # especially once this window becomes a cross-process WorkerW
+        # child below. Installed this early so it also catches WM_SETFOCUS
+        # if Tk's own subsequent setup calls end up triggering one.
+        _install_activation_guard(root_hwnd)
+
         monitor_mode = self.cfg.get("monitor_mode", "primary")
         if monitor_mode not in ("primary", "all"):
             monitor_mode = "primary"
@@ -935,28 +1020,7 @@ class WallpaperWindow:
 
         self.root.update_idletasks()
         hwnd = self.canvas.winfo_id()
-        try:
-            root_hwnd = self.root.winfo_id()
-        except tk.TclError:
-            root_hwnd = hwnd
-        self._root_hwnd = root_hwnd  # kept for tick()'s reparent-health watchdog
-        _debug_log(f"root_hwnd={root_hwnd}, canvas_hwnd={hwnd}, "
-                   f"root rect before reparent={_get_window_rect(root_hwnd)}")
-
-        # Applied while still withdrawn (invisible): never take
-        # keyboard/mouse focus, and let clicks pass straight through to
-        # whatever's actually underneath. This is what actually fixes the
-        # "GUI's monitor stops accepting clicks until you minimize GUI"
-        # bug -- see _make_input_safe()'s docstring. It's independent of
-        # (and a stronger guarantee than) the WorkerW reparenting below,
-        # so it applies whether or not that succeeds.
-        _make_input_safe(root_hwnd)
-        # A second, message-level layer on top of the extended styles
-        # above -- see _install_activation_guard()'s docstring for why
-        # this exists separately rather than trusting the styles alone,
-        # especially once this window becomes a cross-process WorkerW
-        # child below.
-        _install_activation_guard(root_hwnd)
+        _debug_log(f"canvas_hwnd={hwnd}, root rect before reparent={_get_window_rect(root_hwnd)}")
 
         target_rect = (self.x, self.y, self.x + self.w, self.y + self.h)
         self._worker_hwnd = None  # set below if reparenting succeeds; watched by tick()
