@@ -307,7 +307,8 @@
         <p style="font-size:0.85rem;">Double-click the downloaded file. If Windows shows a
         "Windows protected your PC" prompt, click <strong>More info &rarr; Run anyway</strong>
         &mdash; it's a plain, readable script, not a signed app, so Windows flags it as
-        unrecognized rather than unsafe.</p>
+        unrecognized rather than unsafe. Partway through, it'll ask whether to add a Desktop
+        shortcut &mdash; press Y or N (you can add one later from the app itself either way).</p>
       </div>
       <div class="panel install-card" id="card-unix">
         <h3>macOS / Linux</h3>
@@ -459,10 +460,11 @@ python gui.py</code></pre>
       </div>
     </div>
 
-    <p style="font-size:0.85rem;">On Windows, once it's running: <strong>Create Desktop
-    Shortcut...</strong> at the bottom of the sidebar adds a "Flowing Curve Generator"
-    shortcut to your Desktop, pointing at <code>run.bat</code> and using the app's own icon
-    &mdash; a one-time click instead of finding/pinning <code>run.bat</code> by hand.</p>
+    <p style="font-size:0.85rem;">On Windows, <code>run.bat</code> already asks about a Desktop
+    shortcut the first time it sets things up (see <a href="#install">Install</a> above). Said no,
+    or already cloned the repo some other way? <strong>Create Desktop Shortcut...</strong> at the
+    bottom of the sidebar does the exact same thing on demand &mdash; a "Flowing Curve Generator"
+    shortcut on your Desktop, pointing at <code>run.bat</code>, using the app's own icon.</p>
   </section>
 
   <section id="usage">
