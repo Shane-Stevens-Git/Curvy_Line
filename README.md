@@ -28,8 +28,8 @@ It's a desktop app written in Python (Tkinter) for Windows, macOS, and Linux.
 You need [Python 3.10 or newer](https://www.python.org/downloads/) first (on Windows, tick "Add python.exe to PATH").
 The installer then downloads the project, sets up a virtual environment, installs the dependencies, and opens the app.
 
-- **Windows:** download [`install.bat`](https://raw.githubusercontent.com/Shane-Stevens-Git/Curvy_Line/main/install.bat) and double-click it.
-- **macOS / Linux:** download [`install.sh`](https://raw.githubusercontent.com/Shane-Stevens-Git/Curvy_Line/main/install.sh), then run `chmod +x install.sh && ./install.sh`.
+- **Windows:** download [`install.bat`](https://shane-stevens-git.github.io/Curvy_Line/install.bat) and double-click it.
+- **macOS / Linux:** download [`install.sh`](https://shane-stevens-git.github.io/Curvy_Line/install.sh), then run `chmod +x install.sh && ./install.sh`.
 
 Everything runs locally, and nothing you generate leaves your machine.
 
